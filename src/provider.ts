@@ -1699,7 +1699,6 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 
 		const finish = events.finishReason;
 		if (finish !== undefined) {
-			ctx.completed = isCleanFinish(finish);
 			// DeepSeek can return special finish_reasons INSIDE an HTTP 200
 			// response (i.e. mid-stream truncation). The official docs list:
 			//   stop | length | content_filter | tool_calls | insufficient_system_resource
@@ -1738,6 +1737,7 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 			// On truncation, partial tool-call JSON is expected; we flush
 			// best-effort and drop unparseable buffers without throwing.
 			this.reportToolCalls(ctx, ctx.toolCalls.flush(/*throwOnInvalid=*/ isCleanFinish(finish)), progress);
+			ctx.completed = isCleanFinish(finish);
 			this.persistReasoningForTurn(ctx);
 		}
 	}

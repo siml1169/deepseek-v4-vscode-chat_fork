@@ -182,6 +182,22 @@ async function main() {
 		check("unavailable original is not stored as empty", provider._reasoningCache.size(), 0);
 		provider.dispose();
 	}
+	// --- failed clean-finish validation cannot prove an empty original ---
+	{
+		shim.reset();
+		const { provider } = makeProvider();
+		const failed = (await withConsole("error", () => runTurn(provider, {
+			options: { tools: [{ name: "t" }] },
+			chunks: [
+				contentChunk("failed tool answer"),
+				toolCallChunk(0, { id: "invalid", name: "t", args: "{" }),
+				finishChunk("tool_calls"), DONE,
+			],
+		}))).result;
+		check("malformed tool arguments fail the response", Boolean(failed.error), true);
+		check("failed response does not create an empty original", provider._reasoningCache.size(), 0);
+		provider.dispose();
+	}
 	// --- every prior assistant round is restored, including completed rounds ---
 	{
 		shim.reset();
