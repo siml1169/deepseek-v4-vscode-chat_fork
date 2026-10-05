@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Local tool-argument validation against preserved JSON Schema draft-07 definitions. Unknown or omitted tool names and duplicate call IDs are rejected before dispatch.
+- `deepseekv4.preferredTools` prioritizes exact host tool names within the 128-tool limit while preserving host order. Repeated warnings for consecutive identical oversized tool sets are suppressed.
+
+### Fixed
+
+- Tool schemas no longer lose composite branches or have numeric types guessed from property names. Invalid or unsupported schemas are diagnosed and skipped, not silently weakened.
+- Historical tool calls require unique nonempty IDs and exactly one matching result; orphaned, duplicate, and mismatched results are rejected. Streamed calls wait for their original nonblank IDs and names rather than inventing replacements.
+
 ## [0.4.1] - 2026-08-25
 
 ### Removed

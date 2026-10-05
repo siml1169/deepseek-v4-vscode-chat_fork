@@ -45,7 +45,10 @@ export function convertMessages(
 				// by the role gate below, same as before vision support.
 				contentInputs.push({ kind: "image", mimeType: part.mimeType, data: part.data });
 			} else if (part instanceof vscode.LanguageModelToolCallPart) {
-				const id = part.callId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+				const id = part.callId;
+				if (typeof id !== "string" || id.trim().length === 0) {
+					throw new Error("Invalid request: Tool call must have a nonempty callId.");
+				}
 				let args = "{}";
 				try {
 					args = JSON.stringify(part.input ?? {});
@@ -136,6 +139,8 @@ export function convertTools(options: vscode.ProvideLanguageModelChatResponseOpt
 
 /**
  * Validate the request message sequence for correct tool call/result pairing.
+ * Call IDs are unique across the full history; pending calls allow only
+ * consecutive User messages containing matching, single-use tool results.
  * @param messages The full request message list.
  */
 export function validateRequest(messages: readonly vscode.LanguageModelChatRequestMessage[]): void {
@@ -145,41 +150,51 @@ export function validateRequest(messages: readonly vscode.LanguageModelChatReque
 		throw new Error("Invalid request: no messages.");
 	}
 
-	messages.forEach((message, i) => {
-		if (message.role === vscode.LanguageModelChatMessageRole.Assistant) {
-			const toolCallIds = new Set(
-				message.content
-					.filter((part) => part instanceof vscode.LanguageModelToolCallPart)
-					.map((part) => (part as unknown as vscode.LanguageModelToolCallPart).callId)
-			);
-			if (toolCallIds.size === 0) {
-				return;
-			}
+	const seenCallIds = new Set<string>();
+	const pendingCallIds = new Set<string>();
+	const fail = (reason: string): never => {
+		console.error(`[DeepSeek V4] Validation failed: ${reason}`);
+		throw new Error(`Invalid request: ${reason}`);
+	};
+	const missingResult =
+		"Tool call part must be followed by a User message with a LanguageModelToolResultPart with a matching callId.";
 
-			let nextMessageIdx = i + 1;
-			const errMsg =
-				"Invalid request: Tool call part must be followed by a User message with a LanguageModelToolResultPart with a matching callId.";
-			while (toolCallIds.size > 0) {
-				const nextMessage = messages[nextMessageIdx++];
-				if (!nextMessage || nextMessage.role !== vscode.LanguageModelChatMessageRole.User) {
-					console.error("[DeepSeek V4] Validation failed: missing tool result for call IDs:", Array.from(toolCallIds));
-					throw new Error(errMsg);
-				}
-
-				nextMessage.content.forEach((part) => {
-					if (!isToolResultPart(part)) {
-						const ctorName =
-							(Object.getPrototypeOf(part as object) as { constructor?: { name?: string } } | undefined)?.constructor
-								?.name ?? typeof part;
-						console.error("[DeepSeek V4] Validation failed: expected tool result part, got:", ctorName);
-						throw new Error(errMsg);
-					}
-					const callId = (part as { callId: string }).callId;
-					toolCallIds.delete(callId);
-				});
+	for (const message of messages) {
+		const content = message.content ?? [];
+		if (pendingCallIds.size > 0) {
+			if (
+				message.role !== vscode.LanguageModelChatMessageRole.User ||
+				content.length === 0 ||
+				!content.every(isToolResultPart)
+			) {
+				fail(missingResult);
 			}
 		}
-	});
+
+		for (const part of content) {
+			if (part instanceof vscode.LanguageModelToolCallPart) {
+				if (message.role !== vscode.LanguageModelChatMessageRole.Assistant) {
+					fail("Tool call part must belong to an Assistant message.");
+				}
+				const callId = part.callId;
+				if (typeof callId !== "string" || callId.trim().length === 0) {
+					fail("Tool call must have a nonempty callId.");
+				}
+				if (seenCallIds.has(callId)) {
+					fail("Duplicate tool call callId.");
+				}
+				seenCallIds.add(callId);
+				pendingCallIds.add(callId);
+			} else if (part instanceof vscode.LanguageModelToolResultPart || isToolResultPart(part)) {
+				if (message.role !== vscode.LanguageModelChatMessageRole.User || !pendingCallIds.delete(part.callId)) {
+					fail("Tool result must match an outstanding callId exactly once in a User message.");
+				}
+			}
+		}
+	}
+	if (pendingCallIds.size > 0) {
+		fail(missingResult);
+	}
 }
 
 /**

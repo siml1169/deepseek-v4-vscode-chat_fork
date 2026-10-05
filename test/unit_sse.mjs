@@ -149,8 +149,8 @@ check(
 	asm2.add([{ index: 1, id: "call_b", function: { name: "beta", arguments: "{}" } }]),
 	[{ id: "call_b", name: "beta", args: {} }]
 );
-// flush substitutes unknown_tool for the nameless-but-parseable buffer.
-check("flush names the nameless unknown_tool", asm2.flush(false), [{ id: "call_a", name: "unknown_tool", args: {} }]);
+// Truncated calls without identity fields cannot be dispatched.
+check("flush drops nameless calls rather than inventing names", asm2.flush(false), []);
 
 // flush(throwOnInvalid) semantics.
 const asm3 = new ToolCallAssembler();
@@ -165,15 +165,23 @@ check("flush(true) throws on invalid JSON", flushThrow.threw, true);
 check("throw message unchanged from 0.3.x", flushThrow.message, "Invalid JSON for tool call");
 check("…after logging the offending buffer once", flushThrowCapture.lines.length, 1);
 
-// Missing id gets a generated call_<random> at completion time.
+// Missing IDs wait for later deltas, never inventing an identity.
 const asm4 = new ToolCallAssembler();
-const generated = asm4.add([{ index: 0, function: { name: "eps", arguments: "{}" } }]);
-check("generated id has the call_ prefix", /^call_[a-z0-9]+$/.test(generated[0]?.id ?? ""), true);
-// Missing index defaults to 0 and fragments accumulate onto it. The
-// generated id is random, so verify by shape.
+check("missing ID waits for later delta", asm4.add([{ index: 0, function: { name: "eps", arguments: "{}" } }]), []);
+check("late ID completes buffered call", asm4.add([{ index: 0, id: "late_id" }]), [{ id: "late_id", name: "eps", args: {} }]);
+for (const id of [undefined, "", " \t"]) {
+	const incomplete = new ToolCallAssembler();
+	check("missing/blank ID cannot complete", incomplete.add([{ index: 0, id, function: { name: "eps", arguments: "{}" } }]), []);
+	check("missing/blank ID fails clean finish", throwsWith(() => incomplete.flush(true)).message, "Missing tool call ID or name");
+	check("missing/blank ID dropped on truncation", incomplete.flush(false), []);
+}
+const nameless = new ToolCallAssembler();
+nameless.add([{ index: 0, id: "named_id", function: { arguments: "{}" } }]);
+check("missing name fails clean finish", throwsWith(() => nameless.flush(true)).message, "Missing tool call ID or name");
+// Missing index defaults to 0 and fragments accumulate onto it.
 {
 	const asm5 = new ToolCallAssembler();
-	asm5.add([{ function: { name: "zeta", arguments: '{"a"' } }]);
+	asm5.add([{ id: "call_zeta", function: { name: "zeta", arguments: '{"a"' } }]);
 	const completed = asm5.add([{ function: { arguments: ":1}" } }]);
 	check("missing index defaults to 0 and accumulates", completed.length === 1 && completed[0].name === "zeta", true);
 	check("accumulated args parsed", completed[0]?.args, { a: 1 });

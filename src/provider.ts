@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { createHash } from "node:crypto";
 import {
 	CancellationToken,
 	LanguageModelChatInformation,
@@ -26,6 +27,8 @@ import { MODEL_VARIANTS, findVariant } from "./model_catalog";
 import { BASE_URL, BALANCE_URL, fetchWithRetry, formatApiError, type BalanceInfo } from "./api_client";
 import { toWireName, buildWireNameMap } from "./tool_names";
 import { assertAdvertisedToolLimit, MAX_TOOLS_PER_REQUEST } from "./tool_limit";
+import { selectAdvertisedTools } from "./tool_selection";
+import { createToolArgumentValidator } from "./tool_schema";
 import { ReasoningCache, fingerprintAssistantTurn, type CachedTurn, type ReasoningCacheStats } from "./reasoning_cache";
 import { shouldWarnCacheBreakdown } from "./cache_breakdown";
 import { ContextUsageService } from "./context_usage_service";
@@ -255,6 +258,8 @@ class StreamContext {
 	 * VS Code's tool registry dispatches on the names it registered.
 	 */
 	wireNameToHost = new Map<string, string>();
+	readonly argumentValidators = new Map<string, (args: unknown) => void>();
+	readonly reportedCallIds = new Set<string>();
 	/** Whether we've already shown the "💭 Thinking..." text fallback this turn. */
 	hasShownThinkingHint = false;
 }
@@ -264,6 +269,7 @@ class StreamContext {
  */
 export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 	private readonly _reasoningCache = new ReasoningCache(512);
+	private _lastToolLimitSignature: string | undefined;
 
 	/** Adaptive chars-per-token ratio, calibrated from real `usage` data via
 	 * EMA. The starting value of 3.0 is a middle-ground between pure-ASCII
@@ -1163,20 +1169,49 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 			validateRequest(messages);
 
 			const toolConfig = convertTools(options);
+			if (
+				options.toolMode === vscode.LanguageModelChatToolMode.Required &&
+				options.tools?.length &&
+				!toolConfig.tools?.length
+			) {
+				throw new Error(
+					"No usable tools remain for this required-tool request. Check tool schema diagnostics in the extension-host console."
+				);
+			}
+			const wireToHost = buildWireNameMap((options.tools ?? []).map((t) => t?.name));
 			if (toolConfig.tools && toolConfig.tools.length > MAX_TOOLS_PER_REQUEST) {
 				const available = toolConfig.tools.length;
-				// Preserve host order and wire aliases; tool_choice is still
-				// auto/required since the retained set has multiple tools.
-				toolConfig.tools = toolConfig.tools.slice(0, MAX_TOOLS_PER_REQUEST);
+				const preferred = vscode.workspace.getConfiguration("deepseekv4").get<unknown>("preferredTools", []);
+				const signature = createHash("sha256")
+					.update(JSON.stringify([toolConfig.tools.map((tool) => tool.function.name), preferred]))
+					.digest("hex");
+				toolConfig.tools = selectAdvertisedTools(toolConfig.tools, wireToHost, preferred);
 				this.log("request.tools_limited", { available, advertised: toolConfig.tools.length });
-				void vscode.window.showWarningMessage(
-					`DeepSeek supports at most ${MAX_TOOLS_PER_REQUEST} tools per request. Using the first ${MAX_TOOLS_PER_REQUEST} of ${available} tools; ${available - MAX_TOOLS_PER_REQUEST} tools are unavailable for this request. Use Copilot Chat's Configure Tools picker to disable unneeded tools or MCP servers.`
-				);
+				if (signature !== this._lastToolLimitSignature) {
+					this._lastToolLimitSignature = signature;
+					void vscode.window.showWarningMessage(
+						`DeepSeek supports at most ${MAX_TOOLS_PER_REQUEST} tools per request. Using ${MAX_TOOLS_PER_REQUEST} of ${available} tools; ${available - MAX_TOOLS_PER_REQUEST} tools are unavailable for this request. Use Copilot Chat's Configure Tools picker to disable unneeded tools or MCP servers, or set deepseekv4.preferredTools to prioritize specific tool names.`
+					);
+				}
+			} else {
+				this._lastToolLimitSignature = undefined;
 			}
 			// Reverse map for THIS request's tool set (first-wins on the
 			// astronomically-rare wire-name collision, mirroring the
 			// advertise-side skip in convertTools).
-			ctx.wireNameToHost = buildWireNameMap((options.tools ?? []).map((t) => t?.name));
+			for (const tool of toolConfig.tools ?? []) {
+				const wire = tool.function.name;
+				const host = wireToHost.get(wire);
+				if (host !== undefined) {
+					ctx.wireNameToHost.set(wire, host);
+				}
+				ctx.argumentValidators.set(wire, createToolArgumentValidator(tool.function.parameters));
+			}
+			for (const message of openaiMessages) {
+				for (const call of message.tool_calls ?? []) {
+					ctx.reportedCallIds.add(call.id);
+				}
+			}
 
 			// The cap counts the ADVERTISED set, not options.tools — since
 			// the issue #20 wire-aliasing fix, tool assembly may skip
@@ -1743,16 +1778,35 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 	/**
 	 * Report assembled tool calls to the host. The model echoes the wire
 	 * alias; report the HOST name so VS Code's tool registry can dispatch
-	 * (issue #20). Names not in the map (model hallucination) pass through
-	 * unchanged — the same failure mode that existed before aliasing.
+	 * (issue #20). Validate membership and arguments before allowing the
+	 * host to dispatch, including tools omitted by the per-request cap.
 	 */
 	private reportToolCalls(
 		ctx: StreamContext,
 		calls: readonly CompletedToolCall[],
 		progress: vscode.Progress<vscode.LanguageModelResponsePart>
 	): void {
+		const batchIds = new Set<string>();
 		for (const call of calls) {
-			const hostName = ctx.wireNameToHost.get(call.name) ?? call.name;
+			const validate = ctx.argumentValidators.get(call.name);
+			if (!validate || !ctx.wireNameToHost.has(call.name)) {
+				throw new Error(`DeepSeek called an unadvertised tool: ${call.name}.`);
+			}
+			if (!call.id.trim() || ctx.reportedCallIds.has(call.id) || batchIds.has(call.id)) {
+				throw new Error("DeepSeek returned a missing or duplicate tool call ID.");
+			}
+			try {
+				validate(call.args);
+			} catch (error) {
+				throw new Error(
+					`Invalid arguments for tool ${ctx.wireNameToHost.get(call.name)}: ${error instanceof Error ? error.message : "schema validation failed"}`
+				);
+			}
+			batchIds.add(call.id);
+		}
+		for (const call of calls) {
+			ctx.reportedCallIds.add(call.id);
+			const hostName = ctx.wireNameToHost.get(call.name)!;
 			progress.report(new vscode.LanguageModelToolCallPart(call.id, hostName, call.args));
 		}
 	}

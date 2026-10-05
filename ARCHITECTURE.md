@@ -24,7 +24,7 @@ DeepSeekV4ChatModelProvider.provideLanguageModelChatResponse(model, messages, op
          │  split/classify SSE lines via the pure src/sse.ts (splitSseLines / parseSseData / extractDelta)
          ├─ delta.reasoning_content      → ctx.reasoning += chunk, emit ThinkingPart if available
          ├─ delta.content                → emit LanguageModelTextPart
-         ├─ delta.tool_calls             → ctx.toolCalls (ToolCallAssembler, sse.ts), emit LanguageModelToolCallPart once JSON args are valid (echoed wire alias mapped back to the host name)
+         ├─ delta.tool_calls             → ctx.toolCalls (ToolCallAssembler, sse.ts), validate advertised membership, arguments and IDs before emitting LanguageModelToolCallPart (wire alias mapped back to the host name)
          └─ finish_reason / [DONE]       → see "Finish reasons" below for the dispatch table
 ```
 
@@ -118,7 +118,7 @@ extension versions, so it must be a deliberate, versioned decision.
 Because tools can be skipped, DeepSeek's 128-tools-per-request cap is
 enforced against the **advertised** set, not `options.tools` — a host list
 slightly over 128 whose skips bring the broadcast set back under the cap is
-a legal request. The payload assembly itself (schema sanitization, skip
+a legal request. The payload assembly itself (schema validation, skip
 logic, tool_choice) lives in the vscode-free `src/tool_payload.ts` — the
 third extraction after `tool_names.ts` and `tool_choice.ts`, with
 `convertTools` reduced to a thin enum→boolean adapter — so
@@ -131,15 +131,46 @@ deliberately minimal, best-effort text pin over comment-stripped
 `out/provider.js` covers the two properties types can't enforce: the guard
 call exists, and no inline host-list count check has crept back.
 
-After conversion, the provider retains the first 128 advertised tools in
-host order when the usable set exceeds the cap, logs the available and
-advertised counts, and shows an actionable Configure Tools warning. This
+After conversion, the provider selects at most 128 advertised tools using
+`src/tool_selection.ts`. Exact host names in `deepseekv4.preferredTools`
+take priority, remaining slots fill in host order, and the retained set
+keeps its original order. Preferences never enable host-disabled tools.
+The provider logs available/advertised counts on each capped request and
+deduplicates the Configure Tools warning for consecutive identical tool
+sets and preferences. This
 keeps oversized tool sets from failing every chat turn; omitted tools are
 unavailable for that request. The existing advertised-set guard remains a
 defensive assertion. `tool_choice` remains `auto` or `required` for a capped
 set, and wire aliases and history are unchanged. Request-level boundary,
-skip-before-cap, and alias round-trip tests live in
-`test/adapter_provider_request.mjs`.
+skip-before-cap, preferences, warning deduplication, and alias round-trip
+tests live in `test/adapter_provider_request.mjs`.
+
+### Tool schema and dispatch validation
+
+`src/tool_schema.ts` preserves JSON Schema draft-07 semantics using Ajv
+without argument coercion, default insertion, or removal of properties.
+Composite schemas and declared numeric types are preserved, not rewritten.
+Unsupported keywords, formats, dialects, and invalid/unresolved schemas
+produce a diagnostic and skip only that tool. Remote references are never
+fetched. Server-side strict mode is not enabled: its current endpoint and
+schema subset could not be verified, and local validation does not imply a
+server-side guarantee.
+
+The request's dispatch map and validators contain only retained advertised
+tools. Before reporting a completed batch to VS Code, the provider checks
+membership, argument schema conformance, and call-ID uniqueness (including
+IDs from history). The assembler waits for original nonblank IDs and names;
+it rejects missing identity fields on clean completion and drops them on
+truncation, never synthesizing replacements. Invalid calls throw before dispatch; tool arguments are
+not included in the error diagnostics. Schema tests are in
+`test/unit_tool_schema.mjs`; dispatch tests are in
+`test/adapter_provider_tool_validation.mjs`.
+
+`validateRequest` in `src/utils.ts` requires nonempty, history-wide unique
+assistant call IDs and exactly one matching result per call. Parallel results
+may arrive in any order across consecutive user result messages. Orphaned,
+duplicate, unmatched results and unrelated messages during pending calls
+are rejected before the API request; historical IDs are never invented.
 
 ## Finish reasons
 
@@ -153,9 +184,9 @@ inside an HTTP-200 response:
 | `content_filter` | DS safety filter | Log only; flush best-effort, don't throw |
 | `insufficient_system_resource` | Backend mid-stream truncation (DS-specific) | Log, surface an `ErrorMessage` with a "Show Log" button, flush best-effort, don't throw |
 
-The non-clean cases never throw because partial tool-call JSON is *expected*
-on truncation; throwing would discard the reasoning_content already streamed
-to the UI. The user's chat input box will still let them resend; we don't
+The non-clean cases drop unparseable partial tool-call JSON because it is
+*expected* on truncation. Complete calls still undergo membership and schema
+validation before dispatch. The user's chat input box will still let them resend; we don't
 bind a "Retry" button to any chat-host command (no stable, panel-agnostic
 retry command exists in the public VS Code API).
 

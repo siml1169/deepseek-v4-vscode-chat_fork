@@ -72,6 +72,7 @@ Two things a generic OpenAI-compatible bridge cannot do for DeepSeek V4:
 | ------ | ------ | ------ | ------ |
 | `deepseekv4.reasoningEffort` | `high` \| `max` | `max` | Reasoning depth for the `(thinking)` variants; ignored by the others. `high` is faster with shorter chains. Applies to the next message. |
 | `deepseekv4.logRawReasoning` | `boolean` | `false` | Stream raw `reasoning_content` to the log (only useful when debugging cache breakdowns). May capture private code — keep **off** when sharing logs. |
+| `deepseekv4.preferredTools` | Array of exact host tool names | `[]` | Prioritize these tools when more than 128 usable tools are offered. Never enables tools disabled in Copilot's picker; retained tools stay in host order. |
 
 ## Billing & the Copilot premium-request quota
 
@@ -88,7 +89,13 @@ One exception comes from Copilot Chat itself: in **agent mode** it can spawn **s
 ## FAQ
 
 **`Cannot have more than 128 tools per request` (sometimes wrapped in a 502).**
-DeepSeek accepts at most 128 tools. The provider keeps the first 128 usable tools in Copilot's order and warns when the rest are omitted, rather than failing the chat. Omitted tools are unavailable for that request: use Copilot Chat's **Configure Tools** picker to disable unneeded tools or MCP servers so the tools you need fit within the limit.
+DeepSeek accepts at most 128 tools. The provider prioritizes names in `deepseekv4.preferredTools`, fills the remaining slots in Copilot's order, and preserves that order in the request. Without preferences it keeps the first 128 usable tools. A warning appears when the oversized set or preferences change, not on every identical agent turn. Omitted tools are unavailable for that request: use Copilot Chat's **Configure Tools** picker to disable unneeded tools or MCP servers so the tools you need fit within the limit.
+
+**A tool is skipped or its arguments are rejected.**
+Tool schemas retain their JSON Schema draft-07 constraints, including unions and numeric types. Invalid or unsupported schemas are skipped with a diagnostic in the extension-host console rather than silently weakened; tool names, arguments, and call IDs are checked before dispatch. Standard formats are validated locally; unknown formats, unsupported dialects, and unresolved references are rejected. No schemas or references are fetched remotely. If a required-tool request has no usable tools, it fails before sending.
+
+**Does this enable DeepSeek strict mode?**
+No. Local validation is enabled, but server-side strict mode remains deferred until the current official endpoint and supported schema subset can be verified. Optional inputs are not silently made mandatory.
 
 **`The reasoning_content in the thinking mode must be passed back to the API` (400).**
 Not seen since a 2026-08-22 live check (the API accepted every history shape without reasoning), but the docs still define the rule. If it appears, some assistant turn has no cached reasoning (pre-extension history, a cleared cache, or eviction in a very long session): start a new chat; *Show DeepSeek V4 Reasoning Cache Stats* diagnoses.

@@ -102,6 +102,33 @@ async function main() {
 		check(`${usable} usable tools: warning based on advertised count`, shim.calls.showWarningMessage.length, usable > 128 ? 1 : 0);
 		provider.dispose();
 	}
+	// --- explicit preferences and repeated agent-turn warnings ---
+	{
+		shim.reset();
+		shim.answers.getConfiguration = { deepseekv4: { preferredTools: ["mcp.tool.139"] } };
+		const { provider, output } = makeProvider();
+		const tools = Array.from({ length: 140 }, (_, i) => ({ name: `mcp.tool.${i}` }));
+		const turn = () => runTurn(provider, {
+			options: { tools },
+			chunks: [toolCallChunk(0, { id: "preferred", name: toWireName("mcp.tool.139"), args: "{}" }), finishChunk("tool_calls"), DONE],
+		});
+		const first = await turn();
+		check("preferred tool beyond first 128 remains usable", first.error, undefined);
+		const selected = JSON.parse(first.captured.body).tools;
+		check("preferred tool advertised with stable host order", selected.at(-1).function.name, toWireName("mcp.tool.139"));
+		check("earlier nonpreferred tool fills remaining space", selected[126].function.name, toWireName("mcp.tool.126"));
+		check("preferred call reverse-mapped", first.progress.toolCalls()[0]?.name, "mcp.tool.139");
+		await turn();
+		check("same capped set warns only once", shim.calls.showWarningMessage.length, 1);
+		check("each capped request still logs diagnostics", output.text().split("request.tools_limited").length - 1, 2);
+		shim.answers.getConfiguration = { deepseekv4: { preferredTools: ["mcp.tool.138", "mcp.tool.139"] } };
+		await turn();
+		check("changed preference warns again", shim.calls.showWarningMessage.length, 2);
+		await runTurn(provider, { options: { tools: tools.slice(0, 2) } });
+		await turn();
+		check("returning to capped tools after uncapped set warns", shim.calls.showWarningMessage.length, 3);
+		provider.dispose();
+	}
 	// --- missing API key ---
 	{
 		shim.reset();

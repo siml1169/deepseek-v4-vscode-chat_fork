@@ -23,8 +23,16 @@ checkDeep("assistant tool call shape", tc, [
 	{ role: "assistant", content: "thinking aloud", tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Tokyo"}' } }] },
 ]);
 check("tool-call turn without text → content undefined (key absent in JSON)", JSON.stringify(convertMessages([assistantToolCallMsg("", [{ callId: "c", name: "t", input: {} }])])[0]).includes('"content"'), false);
-check("missing callId is generated", typeof convertMessages([assistantToolCallMsg("", [{ callId: "", name: "t", input: {} }])])[0].tool_calls[0].id, "string");
-check("generated callId is non-empty", convertMessages([assistantToolCallMsg("", [{ callId: "", name: "t", input: {} }])])[0].tool_calls[0].id.length > 0, true);
+for (const callId of ["", " \t", undefined, null, 42]) {
+	check(`invalid historical callId ${JSON.stringify(callId)} is not invented`, (() => {
+		try {
+			convertMessages([assistantToolCallMsg("", [{ callId, name: "t", input: {} }])]);
+			return false;
+		} catch (e) {
+			return /nonempty callId/.test(e.message);
+		}
+	})(), true);
+}
 check("input undefined → '{}'", convertMessages([assistantToolCallMsg("", [{ callId: "c", name: "t", input: undefined }])])[0].tool_calls[0].function.arguments, "{}");
 checkMatch("host name is aliased to the wire name", convertMessages([assistantToolCallMsg("", [{ callId: "c", name: "weather.get", input: {} }])])[0].tool_calls[0].function.name, /^weather_get_[0-9a-f]{8}$/);
 check("spec-legal names pass through", convertMessages([assistantToolCallMsg("", [{ callId: "c", name: "read_file", input: {} }])])[0].tool_calls[0].function.name, "read_file");
@@ -97,6 +105,65 @@ const missingResult = withConsole("error", () => { try { validateRequest([userTe
 check("validateRequest: missing result throws", missingResult.result, true);
 check("validateRequest: missing result throws — one error line captured", missingResult.lines.length, 1);
 check("validateRequest: assistant without tool calls needs nothing", (() => { validateRequest([userText("q"), assistantText("a"), userText("b")]); return true; })(), true);
+
+const calls = (...ids) => assistantToolCallMsg("working", ids.map((callId) => ({ callId, name: "weather.get", input: {} })));
+const results = (...ids) => toolResultMsg(ids.map((callId) => ({ callId, content: ["done"] })));
+const parallelHistories = [
+	["parallel results together", [userText("q"), calls("a", "b"), results("a", "b")]],
+	["parallel results in consecutive messages, reversed", [userText("q"), calls("a", "b", "c"), results("c"), results("b", "a")]],
+	["multiple completed tool rounds", [calls("a", "b"), results("b"), results("a"), assistantText("done"), userText("next"), calls("c"), results("c")]],
+	["structural result", [calls("a"), { role: Role.User, content: [{ callId: "a", content: ["done"] }] }]],
+];
+for (const [label, messages] of parallelHistories) {
+	check(`validateRequest: ${label} passes`, (() => { validateRequest(messages); return true; })(), true);
+	const converted = convertMessages(messages);
+	checkDeep(`${label}: converter preserves stable call IDs`, converted.flatMap((m) => m.tool_calls?.map((c) => c.id) ?? []),
+		messages.flatMap((m) => m.content.filter((p) => p instanceof vscode.LanguageModelToolCallPart).map((p) => p.callId)));
+	checkDeep(`${label}: converter preserves result order`, converted.filter((m) => m.role === "tool").map((m) => m.tool_call_id),
+		messages.flatMap((m) => m.content.filter(isToolResultPart).map((p) => p.callId)));
+}
+
+const invalidHistories = [
+	...["", " \t", undefined, null, 42].map((id) => [`invalid call ID ${JSON.stringify(id)}`, [calls(id), results(id)]]),
+	["duplicate parallel call IDs", [calls("a", "a"), results("a")]],
+	["call ID reused after completion", [calls("a"), results("a"), calls("a"), results("a")]],
+	["orphan result", [results("a")]],
+	["orphan result with missing ID", [results(undefined)]],
+	["orphan result with non-string ID", [results(42)]],
+	["result before call", [results("a"), calls("a"), results("a")]],
+	["unmatched result before valid result", [calls("a"), results("unknown", "a")]],
+	["unmatched result after valid result", [calls("a"), results("a", "unknown")]],
+	["duplicate results in one message", [calls("a"), results("a", "a")]],
+	["duplicate results across messages", [calls("a", "b"), results("a"), results("a", "b")]],
+	["duplicate result after completion", [calls("a"), results("a"), results("a")]],
+	["empty result ID", [calls("a"), results("", "a")]],
+	["call ID must match exactly", [calls("a"), results(" a", "a")]],
+	["missing all results at end", [calls("a")]],
+	["missing one parallel result at end", [calls("a", "b"), results("a")]],
+	["assistant content before all results", [calls("a", "b"), results("a"), assistantText("done"), results("b")]],
+	["new calls before all results", [calls("a"), calls("b"), results("a", "b")]],
+	["user content before all results", [calls("a", "b"), results("a"), userText("next"), results("b")]],
+	["system content before results", [calls("a"), textMsg(99, "system"), results("a")]],
+	["empty user message while pending", [calls("a"), { role: Role.User, content: [] }, results("a")]],
+	["text mixed with result while pending", [calls("a"), { role: Role.User, content: [new vscode.LanguageModelTextPart("next"), ...results("a").content] }]],
+	["image mixed with result while pending", [calls("a"), { role: Role.User, content: [...results("a").content, new vscode.LanguageModelDataPart(png, "image/png")] }]],
+	["result on assistant role", [calls("a"), { ...results("a"), role: Role.Assistant }]],
+	["result on system role", [calls("a"), { ...results("a"), role: 99 }]],
+	["call on user role", [{ ...calls("a"), role: Role.User }, results("a")]],
+	["call on system role", [{ ...calls("a"), role: 99 }, results("a")]],
+];
+for (const [label, messages] of invalidHistories) {
+	const rejected = withConsole("error", () => {
+		try {
+			validateRequest(messages);
+			return false;
+		} catch (e) {
+			return /^Invalid request:/.test(e.message);
+		}
+	});
+	check(`validateRequest: ${label} throws`, rejected.result, true);
+	check(`validateRequest: ${label} logs once`, rejected.lines.length, 1);
+}
 
 // --- isToolResultPart ---
 check("isToolResultPart: real part", isToolResultPart(new vscode.LanguageModelToolResultPart("c", [])), true);
