@@ -3,6 +3,7 @@
 // API error → notification mapping, and the usage pipeline (estimator EMA,
 // usage DataPart gating, cache-breakdown warning, context nudge hysteresis).
 import { check, checkMatch, summary, withConsole } from "./helpers/check.mjs";
+import { toWireName } from "../out/tool_names.js";
 import {
 	vscode,
 	shim,
@@ -16,6 +17,7 @@ import {
 	jsonResponse,
 	onFetch,
 	contentChunk,
+	toolCallChunk,
 	finishChunk,
 	usageChunk,
 	DONE,
@@ -49,6 +51,55 @@ async function main() {
 		check("Content-Type json", t.captured.headers["Content-Type"], "application/json");
 		check("reasoning_effort read from settings", String(t.captured.body).includes('"reasoning_effort":"high"'), true);
 		check("model id on the wire is the API name", String(t.captured.body).startsWith('{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]'), true);
+		provider.dispose();
+	}
+	// --- tool cap applies to the advertised set, without failing the turn ---
+	for (const required of [false, true]) {
+		for (const count of [0, 1, 127, 128, 129, 300]) {
+			shim.reset();
+			const { provider, output } = makeProvider();
+			const tools = Array.from({ length: count }, (_, i) => ({ name: `tool_${i}` }));
+			const t = await runTurn(provider, {
+				options: { tools, toolMode: required ? vscode.LanguageModelChatToolMode.Required : vscode.LanguageModelChatToolMode.Auto },
+				chunks: ok({ prompt_tokens: 10, completion_tokens: 1 }),
+			});
+			const label = `${count} tools (${required ? "required" : "auto"})`;
+			check(`${label}: turn succeeds`, t.error, undefined);
+			check(`${label}: one request, no retry`, t.captured.attempts, 1);
+			const body = JSON.parse(t.captured.body);
+			check(`${label}: advertised count`, body.tools?.length ?? 0, Math.min(count, 128));
+			check(`${label}: host order preserved`, body.tools?.map((tool) => tool.function.name).join(","), tools.slice(0, 128).map((tool) => tool.name).join(",") || undefined);
+			const choice = count === 0 ? undefined : required ? count === 1 ? { type: "function", function: { name: "tool_0" } } : "required" : "auto";
+			check(`${label}: tool_choice preserved`, JSON.stringify(body.tool_choice), JSON.stringify(choice));
+			check(`${label}: warning only when capped`, shim.calls.showWarningMessage.length, count > 128 ? 1 : 0);
+			check(`${label}: cap logged only when needed`, output.text().includes("request.tools_limited"), count > 128);
+			if (count > 128) {
+				checkMatch(`${label}: warning explains omitted tools and remedy`, shim.calls.showWarningMessage[0]?.message, /tools are unavailable.*Configure Tools.*MCP servers/);
+				checkMatch(`${label}: original and advertised counts logged`, output.text(), new RegExp(`"available":${count},"advertised":128`));
+			}
+			check(`${label}: caller's tools unchanged`, tools.length, count);
+			provider.dispose();
+		}
+	}
+	for (const usable of [125, 129]) {
+		shim.reset();
+		const { provider } = makeProvider();
+		const tools = [
+			...Array.from({ length: 5 }, () => ({ name: "" })),
+			{ name: "mcp.weather.get" },
+			...Array.from({ length: usable - 1 }, (_, i) => ({ name: `tool_${i}` })),
+		];
+		const t = await quiet(() => runTurn(provider, {
+			options: { tools, toolMode: vscode.LanguageModelChatToolMode.Required },
+			chunks: [toolCallChunk(0, { id: "call_cap", name: toWireName("mcp.weather.get"), args: "{}" }), finishChunk("tool_calls"), DONE],
+		}));
+		check(`${usable} usable tools: turn succeeds after skipping invalid names`, t.error, undefined);
+		const body = JSON.parse(t.captured.body);
+		check(`${usable} usable tools: skips happen before capping`, body.tools.length, Math.min(usable, 128));
+		check(`${usable} usable tools: required mode preserved`, body.tool_choice, "required");
+		check(`${usable} usable tools: aliased name retained`, body.tools[0].function.name, toWireName("mcp.weather.get"));
+		check(`${usable} usable tools: wire call maps back to host`, t.progress.toolCalls()[0]?.name, "mcp.weather.get");
+		check(`${usable} usable tools: warning based on advertised count`, shim.calls.showWarningMessage.length, usable > 128 ? 1 : 0);
 		provider.dispose();
 	}
 	// --- missing API key ---

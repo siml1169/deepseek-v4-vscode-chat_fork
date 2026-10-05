@@ -131,6 +131,16 @@ deliberately minimal, best-effort text pin over comment-stripped
 `out/provider.js` covers the two properties types can't enforce: the guard
 call exists, and no inline host-list count check has crept back.
 
+After conversion, the provider retains the first 128 advertised tools in
+host order when the usable set exceeds the cap, logs the available and
+advertised counts, and shows an actionable Configure Tools warning. This
+keeps oversized tool sets from failing every chat turn; omitted tools are
+unavailable for that request. The existing advertised-set guard remains a
+defensive assertion. `tool_choice` remains `auto` or `required` for a capped
+set, and wire aliases and history are unchanged. Request-level boundary,
+skip-before-cap, and alias round-trip tests live in
+`test/adapter_provider_request.mjs`.
+
 ## Finish reasons
 
 DeepSeek can return five `finish_reason` values, including special ones

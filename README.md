@@ -87,6 +87,9 @@ One exception comes from Copilot Chat itself: in **agent mode** it can spawn **s
 
 ## FAQ
 
+**`Cannot have more than 128 tools per request` (sometimes wrapped in a 502).**
+DeepSeek accepts at most 128 tools. The provider keeps the first 128 usable tools in Copilot's order and warns when the rest are omitted, rather than failing the chat. Omitted tools are unavailable for that request: use Copilot Chat's **Configure Tools** picker to disable unneeded tools or MCP servers so the tools you need fit within the limit.
+
 **`The reasoning_content in the thinking mode must be passed back to the API` (400).**
 Not seen since a 2026-08-22 live check (the API accepted every history shape without reasoning), but the docs still define the rule. If it appears, some assistant turn has no cached reasoning (pre-extension history, a cleared cache, or eviction in a very long session): start a new chat; *Show DeepSeek V4 Reasoning Cache Stats* diagnoses.
 
