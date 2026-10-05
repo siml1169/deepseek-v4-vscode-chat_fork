@@ -41,7 +41,7 @@ function seededProvider() {
 	provider.attachReasoningToHistory(messages, true);
 	provider.dispose();
 	const payload = buildToolPayload(TOOLS, false);
-	const body = buildRequestBody({ apiModel: "deepseek-v4-pro", messages, thinking: true, reasoningEffort: "max", maxOutputTokens: 393216, modelOptions: undefined, tools: payload.tools, tool_choice: payload.tool_choice });
+	const body = buildRequestBody({ apiModel: "deepseek-v4-pro", messages, thinking: true, reasoningEffort: "high", maxOutputTokens: 393216, modelOptions: undefined, tools: payload.tools, tool_choice: payload.tool_choice });
 	const actual = JSON.stringify(body);
 	const EXPECTED =
 		'{"model":"deepseek-v4-pro","messages":[' +
@@ -52,7 +52,7 @@ function seededProvider() {
 		'{"role":"assistant","content":"It is sunny and 22°C in Tokyo.","reasoning_content":"The tool says sunny."},' +
 		'{"role":"user","content":"And tomorrow?"}' +
 		'],"stream":true,"stream_options":{"include_usage":true},"max_tokens":393216,' +
-		'"thinking":{"type":"enabled"},"reasoning_effort":"max",' +
+		'"thinking":{"type":"enabled"},"reasoning_effort":"high",' +
 		'"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],' +
 		'"tool_choice":"auto"}';
 	check("golden 1: thinking + tools, byte-identical", actual, EXPECTED);
@@ -63,10 +63,10 @@ function seededProvider() {
 {
 	const messages = convertMessages(HISTORY, { imageInput: false });
 	// provider strips reasoning_content for non-thinking variants; nothing attached here.
-	const body = buildRequestBody({ apiModel: "deepseek-v4-flash", messages, thinking: false, reasoningEffort: "max", maxOutputTokens: 65536, modelOptions: { temperature: 0.2 }, tools: undefined, tool_choice: undefined });
+	const body = buildRequestBody({ apiModel: "deepseek-flash", messages, thinking: false, reasoningEffort: "high", maxOutputTokens: 65536, modelOptions: { temperature: 0.2 }, tools: undefined, tool_choice: undefined });
 	const actual = JSON.stringify(body);
 	const EXPECTED =
-		'{"model":"deepseek-v4-flash","messages":[' +
+		'{"model":"deepseek-flash","messages":[' +
 		'{"role":"system","content":"You are an expert AI programming assistant."},' +
 		'{"role":"user","content":"What\'s the weather in Tokyo?"},' +
 		'{"role":"assistant","tool_calls":[{"id":"call_00_abc","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Tokyo\\"}"}}]},' +
@@ -81,21 +81,20 @@ function seededProvider() {
 }
 // === Golden 3: vision, image in the last user turn (Flash Vision thinking) ===
 {
-	const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
-	const messages = convertMessages([...HISTORY.slice(0, 5), userImageMsg("What colour is this?", png)], { imageInput: true });
-	const provider = seededProvider();
-	provider.attachReasoningToHistory(messages, true);
-	provider.dispose();
-	const body = buildRequestBody({ apiModel: "deepseek-v4-flash-vision-exp", messages, thinking: true, reasoningEffort: "high", maxOutputTokens: 393216, modelOptions: undefined, tools: undefined, tool_choice: undefined });
+	const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
+	const png = Buffer.from(pngBase64, "base64");
+	const messages = convertMessages([...HISTORY.slice(0, 5), userImageMsg("What colour is this?", png)], { imageInput: true, imageDetail: "high" });
+	// No advertised tools: historical reasoning is ignored, so do not restore it.
+	const body = buildRequestBody({ apiModel: "deepseek-flash", messages, thinking: true, reasoningEffort: "high", maxOutputTokens: 393216, modelOptions: undefined, tools: undefined, tool_choice: undefined });
 	const actual = JSON.stringify(body);
 	const EXPECTED =
-		'{"model":"deepseek-v4-flash-vision-exp","messages":[' +
+		'{"model":"deepseek-flash","messages":[' +
 		'{"role":"system","content":"You are an expert AI programming assistant."},' +
 		'{"role":"user","content":"What\'s the weather in Tokyo?"},' +
-		'{"role":"assistant","tool_calls":[{"id":"call_00_abc","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Tokyo\\"}"}}],"reasoning_content":"I should call get_weather for Tokyo."},' +
+		'{"role":"assistant","tool_calls":[{"id":"call_00_abc","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Tokyo\\"}"}}]},' +
 		'{"role":"tool","tool_call_id":"call_00_abc","content":"Sunny, 22°C"},' +
-		'{"role":"assistant","content":"It is sunny and 22°C in Tokyo.","reasoning_content":"The tool says sunny."},' +
-		'{"role":"user","content":[{"type":"text","text":"What colour is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]}' +
+		'{"role":"assistant","content":"It is sunny and 22°C in Tokyo."},' +
+		`{"role":"user","content":[{"type":"text","text":"What colour is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,${pngBase64}","detail":"high"}}]}` +
 		'],"stream":true,"stream_options":{"include_usage":true},"max_tokens":393216,' +
 		'"thinking":{"type":"enabled"},"reasoning_effort":"high"}';
 	check("golden 3: vision, byte-identical", actual, EXPECTED);

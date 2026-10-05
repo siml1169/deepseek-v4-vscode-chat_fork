@@ -28,9 +28,9 @@ export interface ReasoningCacheStats {
 /**
  * LRU cache keyed by an assistant-turn fingerprint, used to round-trip
  * DeepSeek's `reasoning_content` across turns. DeepSeek requires the
- * reasoning_content of a prior assistant turn (one that contained tool
- * calls) to be passed back in the next request, otherwise the API
- * returns 400. VS Code's chat API has no place for this field, so we
+ * original reasoning_content of every prior assistant turn when thinking
+ * and tools are enabled, including completed rounds. Without tools the
+ * server ignores history reasoning. VS Code's chat API has no place for this field, so we
  * stash it here when streaming the turn out, and re-attach it when
  * converting history for the next request.
  */
@@ -81,7 +81,7 @@ export class ReasoningCache {
 	}
 
 	set(fingerprint: string, reasoning: string): void {
-		if (!reasoning || !fingerprint) {
+		if (typeof reasoning !== "string" || !fingerprint) {
 			return;
 		}
 		this._totalSets++;
@@ -211,7 +211,9 @@ export class ReasoningCache {
 	/** Restore from a previously-serialized snapshot. Truncates to maxSize.
 	 * Also enforces MAX_TOTAL_BYTES on restore — evicts oldest if needed. */
 	restore(entries: CachedTurn[]): void {
-		const valid = entries.filter((e) => e && typeof e.fingerprint === "string" && typeof e.reasoning === "string");
+		const valid = entries.filter(
+			(e) => e && typeof e.fingerprint === "string" && e.fingerprint.length > 0 && typeof e.reasoning === "string"
+		);
 		this.buffer = valid.slice(-this.maxSize);
 		// Rebuild byte counter from restored entries
 		this._totalBytes = 0;

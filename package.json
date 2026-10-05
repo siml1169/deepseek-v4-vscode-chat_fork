@@ -86,15 +86,35 @@
 				"deepseekv4.reasoningEffort": {
 					"type": "string",
 					"enum": [
+						"low",
 						"high",
-						"max"
+						"max",
+						"minimal",
+						"medium",
+						"xhigh",
+						"ultra"
 					],
 					"enumDescriptions": [
-						"Faster responses with shorter reasoning chains.",
-						"Maximum reasoning depth; slower and uses more tokens."
+						"Lighter reasoning for lower latency.",
+						"Balanced reasoning, matching the API default.",
+						"Maximum reasoning depth; slower and uses more tokens.",
+						"Compatibility alias for low.",
+						"Compatibility alias for high.",
+						"Compatibility alias for high.",
+						"Compatibility alias for max."
 					],
-					"default": "max",
+					"default": "high",
 					"markdownDescription": "Reasoning effort for `(thinking)` model variants. Has no effect on non-thinking variants. See [DeepSeek docs](https://api-docs.deepseek.com/guides/thinking_mode)."
+				},
+				"deepseekv4.imageDetail": {
+					"type": "string",
+					"enum": [
+						"low",
+						"high",
+						"original",
+						"auto"
+					],
+					"markdownDescription": "Optional image detail for Flash models. When unset the field is omitted, using the API's original-image default. Low downsizes images for faster processing; high and auto currently behave like original."
 				},
 				"deepseekv4.preferredTools": {
 					"type": "array",
@@ -141,7 +161,7 @@
 					{
 						"id": "tuneReasoningEffort",
 						"title": "Tune reasoning effort (optional)",
-						"description": "Switch between `high` (faster, lighter) and `max` (default, deepest) for `(thinking)` variants. Effect is global and applies to the next message.\n[Open Reasoning Effort Setting](command:workbench.action.openSettings?%22deepseekv4.reasoningEffort%22)",
+						"description": "Choose `low` (lighter), `high` (default), or `max` (deepest) for `(thinking)` variants. Existing explicit choices are preserved. Applies to the next message.\n[Open Reasoning Effort Setting](command:workbench.action.openSettings?%22deepseekv4.reasoningEffort%22)",
 						"media": {
 							"markdown": "resources/walkthrough/tune-effort.md"
 						}
@@ -181,6 +201,7 @@
 	},
 	"dependencies": {
 		"ajv": "^8.20.0",
-		"ajv-formats": "^3.0.1"
+		"ajv-formats": "^3.0.1",
+		"image-size": "^2.0.4"
 	}
 }

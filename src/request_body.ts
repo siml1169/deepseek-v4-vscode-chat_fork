@@ -16,17 +16,25 @@
  * the provider reads VS Code config/options and passes plain values in.
  */
 
-import type { OpenAIChatMessage, OpenAIFunctionToolDef } from "./types";
+import type { OpenAIChatMessage, OpenAIFunctionToolDef, ReasoningEffort } from "./types";
 import type { ToolChoice } from "./tool_choice";
 
 /**
- * Coerce the raw `deepseekv4.reasoningEffort` setting value. The settings UI
- * constrains it to "high" | "max", but a hand-edited settings.json could
- * contain anything — unknown values become "max" rather than being passed
- * through to the API.
+ * Coerce the raw `deepseekv4.reasoningEffort` setting value and compatible
+ * host aliases into the API's low/high/max vocabulary.
+ * Unknown values use the current high default.
  */
-export function coerceReasoningEffort(raw: string | undefined): "high" | "max" {
-	return raw === "high" ? "high" : "max";
+export function coerceReasoningEffort(raw: unknown): ReasoningEffort {
+	switch (raw) {
+		case "minimal":
+		case "low":
+			return "low";
+		case "max":
+		case "ultra":
+			return "max";
+		default:
+			return "high";
+	}
 }
 
 export interface RequestBodyInputs {
@@ -37,10 +45,10 @@ export interface RequestBodyInputs {
 	/** Whether the selected variant runs in thinking mode. */
 	thinking: boolean;
 	/** Coerced effort — only sent when `thinking` is true. */
-	reasoningEffort: "high" | "max";
+	reasoningEffort: ReasoningEffort;
 	/** The variant's output ceiling; the host's max_tokens hint is capped to it. */
 	maxOutputTokens: number;
-	/** Raw host model options (max_tokens hint, temperature, stop, penalties). */
+	/** Raw host model options (max_tokens, temperature, top_p, stop, penalties). */
 	modelOptions?: Record<string, unknown>;
 	tools?: OpenAIFunctionToolDef[];
 	tool_choice?: ToolChoice;
@@ -49,7 +57,7 @@ export interface RequestBodyInputs {
 /**
  * Build the request body object. Key insertion order (= serialization order):
  * model, messages, stream, stream_options, max_tokens, thinking, then
- * reasoning_effort (thinking) or temperature (non-thinking), then the
+ * reasoning_effort and optional top_p (thinking) or temperature (non-thinking), then the
  * non-thinking allow-list (stop, frequency_penalty, presence_penalty), then
  * tools, tool_choice.
  */
@@ -75,8 +83,12 @@ export function buildRequestBody(inputs: RequestBodyInputs): Record<string, unkn
 
 	if (inputs.thinking) {
 		requestBody.reasoning_effort = inputs.reasoningEffort;
-		// Per DeepSeek docs: temperature/top_p/penalty params are ignored
-		// in thinking mode. We omit them to keep the request body honest.
+		// Thinking accepts top_p only in [0.95, 1]; temperature and penalties
+		// remain omitted. Preserve the non-thinking allow-list below.
+		const topP = inputs.modelOptions?.top_p;
+		if (typeof topP === "number" && Number.isFinite(topP)) {
+			requestBody.top_p = Math.max(0.95, Math.min(1, topP));
+		}
 	} else {
 		requestBody.temperature = inputs.modelOptions?.temperature ?? 0.7;
 	}

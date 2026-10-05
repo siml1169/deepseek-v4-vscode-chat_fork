@@ -1,7 +1,7 @@
 // Tests for the pure multimodal content assembly in image_content.ts —
-// the Vision (deepseek-v4-flash-vision-exp) wire format:
+// the Flash (deepseek-flash) wire format:
 //
-//   - MIME normalization + the supported-format gate (JPEG/PNG/GIF/WebP)
+//   - MIME normalization + actual-byte format gate (JPEG/PNG/GIF/WebP)
 //   - base64 `data:` URL encoding for image_url blocks
 //   - buildUserContent: ordered text/image block assembly, adjacent-text
 //     merging, drop accounting (no-vision vs unsupported-MIME), and the
@@ -26,6 +26,8 @@ import {
 	imageDataUrl,
 	buildUserContent,
 	contentText,
+	coerceImageDetail,
+	isSupportedImageData,
 } from "../out/image_content.js";
 
 let passed = 0;
@@ -47,11 +49,16 @@ function check(label, got, expected) {
 
 // "Hello" — bytes whose base64 ("SGVsbG8=") is a well-known fixture.
 const HELLO = new Uint8Array([72, 101, 108, 108, 111]);
-const img = (mimeType, data = HELLO) => ({ kind: "image", mimeType, data });
+const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aG1cAAAAASUVORK5CYII=", "base64");
+const SVG = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>');
+const PNG_URL = imageDataUrl("image/png", PNG);
+const img = (mimeType, data = PNG) => ({ kind: "image", mimeType, data });
 const txt = (text) => ({ kind: "text", text });
+check("byte support check accepts actual PNG", isSupportedImageData(PNG), true);
+check("byte support check rejects actual SVG", isSupportedImageData(SVG), false);
 
 // === 1. Constants pinned to the DeepSeek Vision API contract ===
-check("IMAGE_TOKENS_PER_IMAGE is 384", IMAGE_TOKENS_PER_IMAGE, 384);
+check("IMAGE_TOKENS_PER_IMAGE is 1024", IMAGE_TOKENS_PER_IMAGE, 1024);
 check("MAX_REQUEST_BODY_BYTES is 48 MiB", MAX_REQUEST_BODY_BYTES, 48 * 1024 * 1024);
 check("MAX_IMAGE_BYTES is 32 MiB", MAX_IMAGE_BYTES, 32 * 1024 * 1024);
 check("per-image cap is below the body cap", MAX_IMAGE_BYTES < MAX_REQUEST_BODY_BYTES, true);
@@ -97,9 +104,9 @@ check("vision off → plain string", visionOff.content, "look: ");
 check("vision off → dropped image counted as no-vision", visionOff.droppedNoVision, 1);
 check("vision off → not counted as unsupported", visionOff.droppedUnsupported, 0);
 
-// unsupported MIME on a vision model: dropped and counted separately; a
+// unsupported actual format on a vision model: dropped and counted separately; a
 // message whose ONLY image was unsupported collapses back to string.
-const unsupported = buildUserContent([txt("chart: "), img("image/bmp")], true);
+const unsupported = buildUserContent([txt("chart: "), img("image/png", SVG)], true);
 check("unsupported-only → plain string", unsupported.content, "chart: ");
 check("unsupported image counted", unsupported.droppedUnsupported, 1);
 check("unsupported not counted as no-vision", unsupported.droppedNoVision, 0);
@@ -111,26 +118,50 @@ check("mixed content has 3 blocks (text, image, text)", mixed.content.length, 3)
 check("block order preserved: text first", mixed.content[0], { type: "text", text: "before " });
 check("block order preserved: image second", mixed.content[1], {
 	type: "image_url",
-	image_url: { url: "data:image/png;base64,SGVsbG8=" },
+	image_url: { url: PNG_URL },
 });
 check("block order preserved: text last", mixed.content[2], { type: "text", text: "after" });
 
 const imageOnly = buildUserContent([img("image/jpeg")], true);
 check("image-only message is a single image block", imageOnly.content, [
-	{ type: "image_url", image_url: { url: "data:image/jpeg;base64,SGVsbG8=" } },
+	{ type: "image_url", image_url: { url: PNG_URL } },
 ]);
 
 // Adjacent text around a DROPPED image merges into one block — the block
 // boundary must reflect what is actually sent, not what was attached.
-const droppedBetween = buildUserContent([txt("a"), img("image/bmp"), txt("b"), img("image/png")], true);
+const droppedBetween = buildUserContent([txt("a"), img("image/png", SVG), txt("b"), img("image/png")], true);
 check("dropped image doesn't split text blocks", droppedBetween.content, [
 	{ type: "text", text: "ab" },
-	{ type: "image_url", image_url: { url: "data:image/png;base64,SGVsbG8=" } },
+	{ type: "image_url", image_url: { url: PNG_URL } },
 ]);
 check("mixed drop accounting: 1 unsupported", droppedBetween.droppedUnsupported, 1);
 
 const twoImages = buildUserContent([img("image/png"), img("image/webp")], true);
 check("consecutive images stay separate blocks", twoImages.content.length, 2);
+check("supported MIME mismatch uses actual PNG MIME", twoImages.content[1].image_url.url, PNG_URL);
+for (const mimeType of ["image/avif", "application/octet-stream", "", "image/bmp"]) {
+	check(`actual PNG accepted with declaration ${mimeType}`, buildUserContent([img(mimeType)], true).content[0].image_url.url, PNG_URL);
+}
+let corruptError = "";
+try {
+	buildUserContent([img("image/png", HELLO)], true);
+} catch (error) {
+	corruptError = error.message;
+}
+check("invalid actual image bytes rejected with actionable error", /corrupt or incomplete.*re-export.*JPEG.*PNG.*GIF.*WebP/.test(corruptError), true);
+check("detail omitted keeps the API's original default", "detail" in imageOnly.content[0].image_url, false);
+for (const detail of ["low", "high", "original", "auto"]) {
+	const input = Object.freeze({ ...img("image/jpeg"), detail });
+	const bytesBefore = Buffer.from(input.data);
+	const built = buildUserContent(Object.freeze([input]), true);
+	check(`detail ${detail} is preserved`, built.content[0].image_url.detail, detail);
+	check(`detail ${detail} leaves bytes untouched`, Buffer.from(input.data).equals(bytesBefore), true);
+	check(`detail ${detail} coercion`, coerceImageDetail(detail), detail);
+}
+for (const detail of [undefined, null, "", "medium", 1, {}, "HIGH"]) {
+	check(`invalid detail ${String(detail)} retains omitted default`, coerceImageDetail(detail), undefined);
+}
+check("invalid runtime detail omitted from wire", "detail" in buildUserContent([{ ...img("image/png"), detail: "invalid" }], true).content[0].image_url, false);
 
 // === 7. contentText — flattening the union ===
 check("undefined → empty", contentText(undefined), "");

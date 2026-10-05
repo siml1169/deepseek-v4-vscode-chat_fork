@@ -1,6 +1,6 @@
 /**
  * Pure (vscode-free) assembly of multimodal user-message content for the
- * DeepSeek Vision API (deepseek-v4-flash-vision-exp).
+ * DeepSeek Flash API (deepseek-flash).
  *
  * The Vision endpoint keeps the OpenAI-compatible /chat/completions shape but
  * switches `content` from a plain string to an array of typed blocks:
@@ -9,18 +9,18 @@
  *
  * Extracted from convertMessages in utils.ts — which remains the thin vscode
  * adapter (LanguageModelDataPart → ImagePartInput) — so the block assembly,
- * MIME gating, and drop accounting are importable by the Node unit harness
+ * format gating, and drop accounting are importable by the Node unit harness
  * (test/unit_image_content.mjs) without a vscode mock. Same vscode-free
  * extraction pattern as tool_names.ts / tool_payload.ts / tool_limit.ts.
  */
 
-import type { OpenAIContentPart } from "./types";
+import { imageSize } from "image-size";
+import type { ImageDetail, OpenAIContentPart } from "./types";
 
 /**
  * Image formats the Vision API accepts. DeepSeek sniffs the real format from
- * the file bytes, but an unsupported container still fails the whole request
- * server-side, so we gate on the declared MIME up front and drop (with a
- * warning) rather than gamble the entire turn on one bad attachment.
+ * the file bytes, not the declared MIME or filename. Unsupported actual
+ * containers are dropped rather than risking a server-side request failure.
  */
 export const SUPPORTED_IMAGE_MIME_TYPES: ReadonlySet<string> = new Set([
 	"image/jpeg",
@@ -30,31 +30,34 @@ export const SUPPORTED_IMAGE_MIME_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * DeepSeek bills each image at up to 384 tokens. We use the ceiling as the
+ * DeepSeek bills each image at up to 1024 tokens. We use the ceiling as the
  * local estimate: the pre-flight overflow check must never under-count, and
- * at 384 tokens/image the overshoot is negligible against a 1M window.
+ * at 1024 tokens/image the overshoot is small against a 1M window.
  */
-export const IMAGE_TOKENS_PER_IMAGE = 384;
+export const IMAGE_TOKENS_PER_IMAGE = 1024;
 
 /**
  * The Vision API caps the request body at 48 MiB — base64-encoded image
- * bytes count toward it. Checked against the serialized JSON body right
- * before fetch; the JSON is ASCII-dominated so string length ≈ bytes.
+ * bytes count toward it. Checked against the UTF-8 serialized JSON body
+ * right before fetch.
  */
 export const MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024;
 
 /**
  * DeepSeek caps a single inline (base64 / URL) image at 32 MiB — separate
  * from the 48 MiB body cap; Files API uploads get 64 MiB, which we don't use.
- * Compared against the RAW attachment bytes (the lenient reading; if the
- * server measures the encoded form a borderline image still gets the server
- * error — no worse than before the check). Verified against
- * https://api-docs.deepseek.com/guides/vision on 2026-08-22.
+ * Compared against the raw attachment bytes, before base64 encoding.
  */
 export const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
+export const MAX_IMAGES_PER_REQUEST = 600;
+export const MAX_IMAGE_DIMENSION = 8192;
+export const MAX_IMAGE_DIMENSION_MANY = 4096;
+export const MANY_IMAGES_THRESHOLD = 15;
 
 /** Ordered content inputs harvested from one VS Code chat message. */
-export type UserContentInput = { kind: "text"; text: string } | { kind: "image"; mimeType: string; data: Uint8Array };
+export type UserContentInput =
+	| { kind: "text"; text: string }
+	| { kind: "image"; mimeType: string; data: Uint8Array; detail?: ImageDetail };
 
 /**
  * Result of assembling one message's content. `content` is a plain string
@@ -66,7 +69,7 @@ export interface BuiltUserContent {
 	content: string | OpenAIContentPart[];
 	/** Images dropped because the selected model variant has no image input. */
 	droppedNoVision: number;
-	/** Images dropped because the declared MIME type is not Vision-supported. */
+	/** Images dropped because their actual format is unsupported. */
 	droppedUnsupported: number;
 }
 
@@ -84,6 +87,66 @@ export function isSupportedImageMime(mimeType: string): boolean {
 	return SUPPORTED_IMAGE_MIME_TYPES.has(normalizeImageMime(mimeType));
 }
 
+/** Invalid or omitted detail keeps the API's default original behavior. */
+export function coerceImageDetail(raw: unknown): ImageDetail | undefined {
+	return raw === "low" || raw === "high" || raw === "original" || raw === "auto" ? raw : undefined;
+}
+
+function supportedImageMetadata(input: Extract<UserContentInput, { kind: "image" }>) {
+	try {
+		const metadata = imageSize(input.data);
+		const mimeType = metadata.type === "jpg" ? "image/jpeg" : `image/${metadata.type}`;
+		if (!SUPPORTED_IMAGE_MIME_TYPES.has(mimeType)) {
+			return undefined;
+		}
+		if (!(metadata.width > 0 && metadata.height > 0)) {
+			throw new Error("Invalid image dimensions");
+		}
+		return { mimeType, width: metadata.width, height: metadata.height };
+	} catch {
+		throw new Error("Cannot read this image's format or dimensions. The image may be corrupt or incomplete; re-export it as JPEG, PNG, GIF, or WebP before sending.");
+	}
+}
+
+/** Inspect actual bytes; corrupt metadata throws rather than bypassing validation. */
+export function isSupportedImageData(data: Uint8Array): boolean {
+	return supportedImageMetadata({ kind: "image", mimeType: "", data }) !== undefined;
+}
+
+/**
+ * Validate the combined USER inputs actually sent in one request, not merely
+ * the latest attachment list. Unsupported images are dropped by the builder
+ * and must not tighten the count-dependent dimension limit.
+ */
+export function validateImageInputs(inputs: readonly UserContentInput[]): { count: number; maxBytes: number } {
+	const images = [];
+	let maxBytes = 0;
+	for (const input of inputs) {
+		if (input.kind !== "image") {
+			continue;
+		}
+		if (input.data.byteLength > MAX_IMAGE_BYTES) {
+			throw new Error(`Image ${images.length + 1} is ${(input.data.byteLength / (1024 * 1024)).toFixed(1)} MiB; the inline image limit is 32 MiB. Compress or resize the image before sending.`);
+		}
+		const metadata = supportedImageMetadata(input);
+		if (!metadata) {
+			continue;
+		}
+		maxBytes = Math.max(maxBytes, input.data.byteLength);
+		images.push(metadata);
+	}
+	if (images.length > MAX_IMAGES_PER_REQUEST) {
+		throw new Error(`This request contains ${images.length} images; DeepSeek accepts at most 600 images per request. Remove images or start a new conversation.`);
+	}
+	const dimensionLimit = images.length >= MANY_IMAGES_THRESHOLD ? MAX_IMAGE_DIMENSION_MANY : MAX_IMAGE_DIMENSION;
+	for (const [index, image] of images.entries()) {
+		if (image.width > dimensionLimit || image.height > dimensionLimit) {
+			throw new Error(`Image ${index + 1} is ${image.width}×${image.height}; each side must be at most ${dimensionLimit} pixels for a request with ${images.length} images. Resize the image${dimensionLimit === MAX_IMAGE_DIMENSION_MANY ? " or reduce the request to fewer than 15 images" : ""}.`);
+		}
+	}
+	return { count: images.length, maxBytes };
+}
+
 /** Encode raw image bytes as a `data:` URL for an image_url block. */
 export function imageDataUrl(mimeType: string, data: Uint8Array): string {
 	return `data:${normalizeImageMime(mimeType)};base64,${Buffer.from(data).toString("base64")}`;
@@ -99,6 +162,9 @@ export function imageDataUrl(mimeType: string, data: Uint8Array): string {
  * string the non-vision variants have always sent.
  */
 export function buildUserContent(inputs: readonly UserContentInput[], imageInput: boolean): BuiltUserContent {
+	if (imageInput) {
+		validateImageInputs(inputs);
+	}
 	const blocks: OpenAIContentPart[] = [];
 	let droppedNoVision = 0;
 	let droppedUnsupported = 0;
@@ -117,11 +183,17 @@ export function buildUserContent(inputs: readonly UserContentInput[], imageInput
 			droppedNoVision++;
 			continue;
 		}
-		if (!isSupportedImageMime(input.mimeType)) {
+		const metadata = supportedImageMetadata(input);
+		if (!metadata) {
 			droppedUnsupported++;
 			continue;
 		}
-		blocks.push({ type: "image_url", image_url: { url: imageDataUrl(input.mimeType, input.data) } });
+		const imageUrl: { url: string; detail?: ImageDetail } = { url: imageDataUrl(metadata.mimeType, input.data) };
+		const detail = coerceImageDetail(input.detail);
+		if (detail !== undefined) {
+			imageUrl.detail = detail;
+		}
+		blocks.push({ type: "image_url", image_url: imageUrl });
 	}
 
 	const hasImage = blocks.some((b) => b.type === "image_url");

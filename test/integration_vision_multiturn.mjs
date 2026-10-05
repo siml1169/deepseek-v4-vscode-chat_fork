@@ -48,7 +48,7 @@ if (!API_KEY) {
 }
 
 const BASE_URL = "https://api.deepseek.com/v1";
-const MODEL = "deepseek-v4-flash-vision-exp";
+const MODEL = "deepseek-flash";
 // DeepSeek's prompt cache is built asynchronously after a request completes;
 // give it a moment before the follow-up so a "miss" means miss, not "too soon".
 const CACHE_SETTLE_MS = 2500;

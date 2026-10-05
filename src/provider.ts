@@ -12,7 +12,7 @@ import {
 
 import type { DSUsage, OpenAIChatMessage } from "./types";
 
-import { convertTools, convertMessages, validateRequest } from "./utils";
+import { convertTools, convertMessages, validateRequest, collectUserImageInputs, isImageDataPart } from "./utils";
 import {
 	splitSseLines,
 	parseSseData,
@@ -21,7 +21,7 @@ import {
 	ToolCallAssembler,
 	type CompletedToolCall,
 } from "./sse";
-import { IMAGE_TOKENS_PER_IMAGE, MAX_IMAGE_BYTES, MAX_REQUEST_BODY_BYTES, contentText } from "./image_content";
+import { IMAGE_TOKENS_PER_IMAGE, MAX_IMAGE_BYTES, MAX_REQUEST_BODY_BYTES, contentText, coerceImageDetail, validateImageInputs } from "./image_content";
 import { buildRequestBody, coerceReasoningEffort } from "./request_body";
 import { MODEL_VARIANTS, findVariant } from "./model_catalog";
 import { BASE_URL, BALANCE_URL, fetchWithRetry, formatApiError, type BalanceInfo } from "./api_client";
@@ -33,6 +33,7 @@ import { ReasoningCache, fingerprintAssistantTurn, type CachedTurn, type Reasoni
 import { shouldWarnCacheBreakdown } from "./cache_breakdown";
 import { ContextUsageService } from "./context_usage_service";
 import { classifyRequestKind, isReportableContextRequest, type RequestKind } from "./request_kind";
+import { countHistoryChars, countToolChars, estimateInputTokens } from "./input_accounting";
 
 const REASONING_CACHE_STATE_KEY = "deepseekv4.reasoningCache";
 
@@ -247,6 +248,9 @@ class StreamContext {
 	readonly toolCalls = new ToolCallAssembler();
 	/** Full reasoning_content for this turn — round-tripped on the next turn. */
 	reasoning = "";
+	reasoningPersisted = false;
+	thinking = false;
+	completed = false;
 	/** Visible text emitted this turn — fallback fingerprint when no tool_calls. */
 	emittedText = "";
 	/** Tool calls emitted this turn — primary fingerprint anchor when present. */
@@ -342,10 +346,9 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 		private readonly statusBar: vscode.StatusBarItem
 	) {
 		this.outputChannel.appendLine("[ctor] provider instance created");
-
 		// Restore persisted reasoning cache so multi-turn agent loops survive
-		// VS Code restarts. Without this, a new session always 400s on the
-		// second turn until the user starts a fresh conversation.
+		// VS Code restarts. Missing originals cannot be reconstructed and
+		// can make thinking+tool continuation invalid.
 		const saved = this.globalState.get<CachedTurn[]>(REASONING_CACHE_STATE_KEY);
 		if (Array.isArray(saved) && saved.length > 0) {
 			this._reasoningCache.restore(saved);
@@ -579,7 +582,7 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 		// Reasoning effort row: shows the current setting value plus a click-
 		// through to the specific setting. Helps discoverability — users who
 		// hover the status bar to check cost will also notice this control.
-		const currentEffort = vscode.workspace.getConfiguration("deepseekv4").get<string>("reasoningEffort", "max");
+		const currentEffort = coerceReasoningEffort(vscode.workspace.getConfiguration("deepseekv4").get<string>("reasoningEffort", "high"));
 		md.appendMarkdown(
 			`**Reasoning effort** &nbsp; \`${currentEffort}\` &nbsp; [$(gear) configure](command:workbench.action.openSettings?%22deepseekv4.reasoningEffort%22)\n\n`
 		);
@@ -869,19 +872,7 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 	 * for the local maxInputTokens guard; over/under by ~30% is harmless.
 	 */
 	private estimateText(text: string): number {
-		return Math.ceil(text.length / this._charsPerToken);
-	}
-
-	private countMessageChars(msgs: readonly vscode.LanguageModelChatMessage[]): number {
-		let total = 0;
-		for (const m of msgs) {
-			for (const part of m.content) {
-				if (part instanceof vscode.LanguageModelTextPart) {
-					total += part.value.length;
-				}
-			}
-		}
-		return total;
+		return estimateInputTokens(text.length, this._charsPerToken);
 	}
 
 	/**
@@ -895,21 +886,17 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 	 * pre-check (MAX_IMAGE_BYTES).
 	 */
 	private imageStats(msgs: readonly vscode.LanguageModelChatMessage[]): { count: number; maxBytes: number } {
-		let count = 0;
-		let maxBytes = 0;
-		for (const m of msgs) {
-			if (m.role !== vscode.LanguageModelChatMessageRole.User) {
-				continue;
-			}
-			for (const part of m.content) {
-				const obj = part as { mimeType?: unknown; data?: unknown };
-				if (typeof obj.mimeType === "string" && obj.mimeType.startsWith("image/") && obj.data instanceof Uint8Array) {
-					count++;
-					maxBytes = Math.max(maxBytes, obj.data.byteLength);
-				}
+		const inputs = collectUserImageInputs(msgs);
+		// Check raw byte limits before metadata inspection or base64 allocation.
+		for (const input of inputs) {
+			if (input.kind === "image" && input.data.byteLength > MAX_IMAGE_BYTES) {
+				const sizeMiB = (input.data.byteLength / (1024 * 1024)).toFixed(1);
+				throw new Error(
+					`Image attachment exceeds DeepSeek's 32 MiB per-image limit (${sizeMiB} MiB). Attach a smaller image, or start a new chat.`
+				);
 			}
 		}
-		return { count, maxBytes };
+		return validateImageInputs(inputs);
 	}
 
 	/** Concatenated text of a single chat message (text parts only). */
@@ -944,19 +931,6 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 		}
 		const toolNames = options.tools?.map((t) => t.name) ?? [];
 		return classifyRequestKind(firstText, latestUserText, toolNames);
-	}
-
-	private countToolChars(
-		tools: { type: string; function: { name: string; description?: string; parameters?: object } }[] | undefined
-	): number {
-		if (!tools || tools.length === 0) {
-			return 0;
-		}
-		try {
-			return JSON.stringify(tools).length;
-		} catch {
-			return 0;
-		}
 	}
 
 	/**
@@ -1113,8 +1087,21 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 			if (!variant) {
 				throw new Error(`Unknown DeepSeek model variant: ${model.id}`);
 			}
+			ctx.thinking = variant.thinking;
 
-			const openaiMessages = convertMessages(messages, { imageInput: variant.vision === true });
+			let images = { count: 0, maxBytes: 0 };
+			if (variant.vision === true) {
+				try {
+					images = this.imageStats(messages);
+				} catch (error) {
+					const detail = error instanceof Error ? error.message : "Invalid image input.";
+					this.log("request.invalid_images", { detail });
+					void vscode.window.showErrorMessage(`DeepSeek image input rejected. ${detail}`);
+					throw error;
+				}
+			}
+			const imageDetail = coerceImageDetail(vscode.workspace.getConfiguration("deepseekv4").get<unknown>("imageDetail"));
+			const openaiMessages = convertMessages(messages, { imageInput: variant.vision === true, imageDetail });
 			this.log("request.history", {
 				modelId: model.id,
 				count: openaiMessages.length,
@@ -1144,28 +1131,7 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 			}
 			const isRealTurn = isReportableContextRequest(kind);
 
-			// Only attach reasoning_content when the current request is in
-			// thinking mode. Sending reasoning_content to a non-thinking
-			// endpoint wastes prefix tokens (server still has to tokenise it
-			// before discarding) and the empty-string fallback breaks
-			// prompt-cache prefix anyway. When user switches from a thinking
-			// variant to a non-thinking one mid-conversation, prior assistant
-			// turns may also already carry reasoning_content — strip it.
-			//
-			// The attach itself runs for EVERY thinking request — auxiliary
-			// requests need the "" stub too or the API 400s — but only real
-			// conversation turns count toward the cache hit/miss statistics.
 			let reasoningStats = { hits: 0, misses: 0 };
-			if (variant.thinking) {
-				reasoningStats = this.attachReasoningToHistory(openaiMessages, isRealTurn);
-			} else {
-				for (const m of openaiMessages) {
-					if (m.role === "assistant" && m.reasoning_content !== undefined) {
-						delete m.reasoning_content;
-					}
-				}
-			}
-
 			validateRequest(messages);
 
 			const toolConfig = convertTools(options);
@@ -1221,35 +1187,29 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 			// error; see tool_limit.ts.
 			assertAdvertisedToolLimit(toolConfig.tools);
 
-			const messageChars = this.countMessageChars(messages);
-			const toolChars = this.countToolChars(toolConfig.tools);
+			// DeepSeek ignores historical reasoning without tools. With tools
+			// and thinking enabled, replay every assistant round, not just the
+			// currently active tool-call round.
+			if (variant.thinking && toolConfig.tools?.length) {
+				reasoningStats = this.attachReasoningToHistory(openaiMessages, isRealTurn);
+			} else {
+				for (const message of openaiMessages) {
+					delete message.reasoning_content;
+				}
+			}
+			const messageChars = countHistoryChars(openaiMessages);
+			const toolChars = countToolChars(toolConfig.tools);
 			// Per-request char count lives in a LOCAL — if it were on the
 			// instance, two concurrent provideLanguageModelChatResponse calls
 			// could overwrite each other between the fetch and the usage
 			// callback, polluting the EMA estimator with the wrong request's
 			// size.
 			const requestInputChars = messageChars + toolChars;
-			// Images bypass the char-based estimator: each is billed at up to
-			// 384 tokens regardless of byte size. Counted only for vision
-			// variants — everywhere else convertMessages drops them.
-			const images = variant.vision === true ? this.imageStats(messages) : { count: 0, maxBytes: 0 };
-			// Per-image transport cap (separate from the 48 MiB body cap below):
-			// DeepSeek rejects a single inline image over 32 MiB. Fail here with
-			// an actionable message rather than after the whole body is built.
-			// A history image can only be over the cap if it was attached while
-			// a non-Vision variant was selected (dropped then, sent now) — hence
-			// the "start a new chat" escape hatch.
-			if (images.maxBytes > MAX_IMAGE_BYTES) {
-				const sizeMiB = (images.maxBytes / (1024 * 1024)).toFixed(1);
-				this.log("request.image_too_large", { bytes: images.maxBytes, limit: MAX_IMAGE_BYTES });
-				void vscode.window.showErrorMessage(
-					`DeepSeek image too large. One attachment is ${sizeMiB} MiB — over DeepSeek's 32 MiB per-image limit. Attach a smaller image, or start a new chat.`
-				);
-				throw new Error(`Image attachment exceeds DeepSeek's 32 MiB per-image limit (${sizeMiB} MiB).`);
-			}
+			// Accepted user images were validated before conversion and are
+			// budgeted separately at the documented per-image ceiling.
 			const imageTokenCount = images.count * IMAGE_TOKENS_PER_IMAGE;
-			const inputTokenCount = Math.ceil(messageChars / this._charsPerToken) + imageTokenCount;
-			const toolTokenCount = Math.ceil(toolChars / this._charsPerToken);
+			const inputTokenCount = estimateInputTokens(messageChars, this._charsPerToken, imageTokenCount);
+			const toolTokenCount = estimateInputTokens(toolChars, this._charsPerToken);
 			const tokenLimit = Math.max(1, model.maxInputTokens);
 			// Publish a pre-request estimate so the QuickPick (and any
 			// other reader) has something to show even if the request
@@ -1281,7 +1241,7 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 			// test in test/unit_request_body.mjs. Only the VS Code reads stay
 			// here.
 			const effort = coerceReasoningEffort(
-				vscode.workspace.getConfiguration("deepseekv4").get<string>("reasoningEffort", "max")
+				vscode.workspace.getConfiguration("deepseekv4").get<string>("reasoningEffort", "high")
 			);
 			if (variant.thinking) {
 				this.outputChannel.appendLine(`[req] reasoning_effort=${effort} (variant=${variant.id})`);
@@ -1299,13 +1259,14 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 			// Serialize once: reused for the size guard and the fetch body.
 			// DeepSeek caps the request body at 48 MiB, and base64 image
 			// payloads are what realistically get near it — the token
-			// pre-check can pass (images are ~384 tokens each) while the
+			// pre-check can pass (images are up to 1024 tokens each) while the
 			// encoded bytes blow the transport cap. Catch it locally with an
 			// actionable message instead of surfacing an opaque server 4xx.
 			const bodyJson = JSON.stringify(requestBody);
-			if (bodyJson.length > MAX_REQUEST_BODY_BYTES) {
-				const sizeMiB = (bodyJson.length / (1024 * 1024)).toFixed(1);
-				this.log("request.too_large", { bytes: bodyJson.length, limit: MAX_REQUEST_BODY_BYTES });
+			const bodyBytes = Buffer.byteLength(bodyJson, "utf8");
+			if (bodyBytes > MAX_REQUEST_BODY_BYTES) {
+				const sizeMiB = (bodyBytes / (1024 * 1024)).toFixed(1);
+				this.log("request.too_large", { bytes: bodyBytes, limit: MAX_REQUEST_BODY_BYTES });
 				const detail = variant.vision
 					? `Request body is ${sizeMiB} MiB — over DeepSeek's 48 MiB limit. Attach fewer or smaller images, or start a new chat.`
 					: `Request body is ${sizeMiB} MiB — over DeepSeek's 48 MiB limit. Start a new chat or shorten the conversation.`;
@@ -1501,29 +1462,34 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 	 * @returns A promise that resolves to the number of tokens
 	 */
 	async provideTokenCount(
-		_model: LanguageModelChatInformation,
+		model: LanguageModelChatInformation,
 		text: string | LanguageModelChatMessage,
 		_token: CancellationToken
 	): Promise<number> {
 		if (typeof text === "string") {
 			return this.estimateText(text);
 		}
-		let total = 0;
-		for (const part of text.content) {
-			if (part instanceof vscode.LanguageModelTextPart) {
-				total += this.estimateText(part.value);
-			} else {
-				// Image attachments bill at up to 384 tokens each on the Vision
-				// variants — budget them at the ceiling so the host's prompt
-				// planning never under-counts. Same structural detection as
-				// countImageParts.
-				const obj = part as { mimeType?: unknown; data?: unknown };
-				if (typeof obj.mimeType === "string" && obj.mimeType.startsWith("image/") && obj.data instanceof Uint8Array) {
-					total += IMAGE_TOKENS_PER_IMAGE;
+		const variant = findVariant(model.id);
+		const converted = convertMessages([{ ...text, content: text.content.filter((part) => !isImageDataPart(part)) }]);
+		// The callback lacks request tools. Budget cached reasoning conservatively
+		// for thinking models; preflight omits it when no tools are advertised.
+		if (variant?.thinking) {
+			for (const message of converted) {
+				if (message.role !== "assistant") {
+					continue;
+				}
+				const fp = fingerprintAssistantTurn({
+					text: contentText(message.content),
+					toolCalls: (message.tool_calls ?? []).map((call) => ({ id: call.id, name: call.function.name })),
+				});
+				const reasoning = this._reasoningCache.get(fp, false);
+				if (reasoning !== undefined) {
+					message.reasoning_content = reasoning;
 				}
 			}
 		}
-		return total;
+		const images = variant?.vision === true ? this.imageStats([text]).count : 0;
+		return estimateInputTokens(countHistoryChars(converted), this._charsPerToken, images * IMAGE_TOKENS_PER_IMAGE);
 	}
 
 	/**
@@ -1733,6 +1699,7 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 
 		const finish = events.finishReason;
 		if (finish !== undefined) {
+			ctx.completed = isCleanFinish(finish);
 			// DeepSeek can return special finish_reasons INSIDE an HTTP 200
 			// response (i.e. mid-stream truncation). The official docs list:
 			//   stop | length | content_filter | tool_calls | insufficient_system_resource
@@ -1817,15 +1784,15 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 	 * tests confirm that when `tools` are advertised in a thinking-mode
 	 * request, DeepSeek demands EVERY prior assistant turn carry
 	 * reasoning_content, not just turns that themselves invoked a tool.
-	 * (When no tools are advertised, no-tc turns don't need it — but
-	 * caching them anyway is harmless and simplifies the logic.)
+	 * (Without tools the server ignores all historical reasoning, but
+	 * cache it for a future request that advertises tools.)
 	 *
 	 * Fingerprint anchors:
 	 *   - tool_calls present → name:id (most stable)
 	 *   - otherwise          → emitted visible text (whitespace-normalized)
 	 */
 	private persistReasoningForTurn(ctx: StreamContext): void {
-		if (!ctx.reasoning) {
+		if (ctx.reasoningPersisted) {
 			return;
 		}
 		// Close out the live thinking stream with a newline so subsequent
@@ -1833,12 +1800,14 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 		// unconditionally so users know reasoning happened even when raw
 		// streaming is gated off (`deepseekv4.logRawReasoning` = false).
 		const logRawReasoning = vscode.workspace.getConfiguration("deepseekv4").get<boolean>("logRawReasoning", false);
-		if (logRawReasoning) {
+		if (ctx.reasoning && logRawReasoning) {
 			this.outputChannel.appendLine("");
 		}
-		this.outputChannel.appendLine(
-			`[${new Date().toISOString().slice(11, 23)}] thinking.end ▲ (${ctx.reasoning.length} chars)`
-		);
+		if (ctx.reasoning) {
+			this.outputChannel.appendLine(
+				`[${new Date().toISOString().slice(11, 23)}] thinking.end ▲ (${ctx.reasoning.length} chars)`
+			);
+		}
 		// Degenerate anchor: on hosts without LanguageModelThinkingPart the
 		// hint is a real TextPart, so EVERY turn cancelled before its first
 		// content/tool-call delta has emittedText === THINKING_FALLBACK_HINT.
@@ -1861,6 +1830,14 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 			ctx.reasoning = "";
 			return;
 		}
+		if (!ctx.reasoning) {
+			// Only a completed thinking response proves an empty original.
+			// Cancellation, incomplete streams and disabled thinking do not.
+			if (!ctx.thinking || !ctx.completed) {
+				return;
+			}
+		}
+		ctx.reasoningPersisted = true;
 		this.log("cache.set", {
 			fp,
 			mode: fp.startsWith("tc:") ? "tool_calls" : "text",
@@ -1903,19 +1880,8 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 
 	/**
 	 * Walk the converted history and re-attach `reasoning_content` to every
-	 * prior assistant turn (with or without tool_calls). Integration tests
-	 * confirm: DeepSeek's actual rule for thinking-mode requests is:
-	 *   - `tools` not advertised → only tc-assistant turns NEED reasoning
-	 *   - `tools` advertised     → ALL prior assistant turns NEED reasoning
-	 * Mutates messages in place.
-	 * On cache miss, sets reasoning_content="" as fallback to prevent a
-	 * guaranteed 400 from the API. The conversation may be slightly degraded
-	 * (the model loses one turn's reasoning context) but can continue.
-	 *
-	 * `countStats=false` (auxiliary requests) performs the identical attach —
-	 * the "" stub is required for every thinking request — but keeps the
-	 * lookups out of the cache's hit/miss statistics; see ReasoningCache.get.
-	 * The returned {hits, misses} always reflects THIS request regardless.
+	 * prior assistant turn when both thinking and tools are enabled.
+	 * Unavailable originals fail locally. Only observed empty originals get "".
 	 */
 	private attachReasoningToHistory(messages: OpenAIChatMessage[], countStats = true): { hits: number; misses: number } {
 		let hits = 0;
@@ -1924,7 +1890,7 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 			if (msg.role !== "assistant") {
 				continue;
 			}
-			if (msg.reasoning_content) {
+			if (msg.reasoning_content !== undefined) {
 				continue;
 			}
 			// contentText flattens the (string | block-array) union; assistant
@@ -1941,16 +1907,11 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 				continue;
 			}
 			const reasoning = this._reasoningCache.get(fp, countStats);
-			if (reasoning) {
+			if (reasoning !== undefined) {
 				msg.reasoning_content = reasoning;
 				hits++;
 			} else {
 				misses++;
-				// Fallback: set empty reasoning_content so the API doesn't 400.
-				// This covers turns where reasoning was never cached (empty
-				// CoT, evicted, or from a pre-cache session). The model loses
-				// this turn's reasoning context but the conversation survives.
-				msg.reasoning_content = "";
 				const tcSummary = (msg.tool_calls ?? []).map((tc) => `${tc.function.name}:${tc.id}`);
 				this.log("cache.MISS", {
 					fp,
@@ -1958,7 +1919,18 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 					toolCalls: tcSummary,
 					contentLen: contentText(msg.content).length,
 					cacheKeys: this._reasoningCache.keys(),
+					diagnostic: "Original assistant reasoning unavailable; an empty placeholder cannot reconstruct it.",
 				});
+				const diagnostic =
+					"DeepSeek original assistant reasoning is unavailable. Start a new chat to rebuild tool history, or use Show Log to inspect reasoning-cache misses. Alternatively disable tools or select a non-thinking model. An empty placeholder cannot reconstruct the original reasoning.";
+				void vscode.window.showErrorMessage(diagnostic, "Start New Chat", "Show Log").then((choice) => {
+					if (choice === "Start New Chat") {
+						void vscode.commands.executeCommand("workbench.action.chat.newChat");
+					} else if (choice === "Show Log") {
+						void vscode.commands.executeCommand("deepseekv4.showLog");
+					}
+				});
+				throw new Error(diagnostic);
 			}
 		}
 		if (hits + misses > 0) {

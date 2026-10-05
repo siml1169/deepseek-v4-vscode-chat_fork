@@ -1,9 +1,9 @@
 // Reasoning round-trip through the real provider: attachReasoningToHistory
-// (hit / miss → "" / non-thinking strip / stats gating), persistReasoningForTurn
+// (hit / unavailable-original diagnosis / non-thinking strip / stats gating), persistReasoningForTurn
 // anchors (tc: / tx:, wire names), and cross-instance restore from globalState.
 import { createRequire } from "node:module";
-import { check, checkDeep, checkMatch, summary, until } from "./helpers/check.mjs";
-import { OUT, shim, makeProvider, runTurn, model, userText, assistantText, assistantToolCallMsg, toolResultMsg, reasoningChunk, contentChunk, toolCallChunk, finishChunk, usageChunk, DONE } from "./helpers/fakes.mjs";
+import { check, checkMatch, summary, until, withConsole } from "./helpers/check.mjs";
+import { OUT, shim, makeProvider, runTurn, model, userText, assistantText, assistantToolCallMsg, toolResultMsg, reasoningChunk, contentChunk, toolCallChunk, finishChunk, usageChunk, DONE, cancellation } from "./helpers/fakes.mjs";
 
 const require = createRequire(import.meta.url);
 const { fingerprintAssistantTurn } = require(OUT("reasoning_cache.js"));
@@ -16,20 +16,23 @@ async function main() {
 		const fpHit = fingerprintAssistantTurn({ text: "Cached answer.", toolCalls: [] });
 		provider._reasoningCache.set(fpHit, "my reasoning");
 		const msgs = convertMessages([userText("q"), assistantText("Cached answer."), userText("q2"), assistantText("Uncached answer."), userText("q3")]);
-		const stats = provider.attachReasoningToHistory(msgs, true);
-		checkDeep("hit + miss counted", stats, { hits: 1, misses: 1 });
+		let missing;
+		try { provider.attachReasoningToHistory(msgs, true); } catch (error) { missing = error; }
+		checkMatch("plain-text unavailable original fails locally", missing?.message, /original assistant reasoning is unavailable/);
 		check("hit gets the cached reasoning", msgs[1].reasoning_content, "my reasoning");
-		check("miss gets the empty-string stub", msgs[3].reasoning_content, "");
+		check("miss never invents an empty original", msgs[3].reasoning_content, undefined);
 		check("user turns untouched", msgs[0].reasoning_content, undefined);
 		const cs = provider.getCacheStats();
 		check("real turn counts toward cache stats (gets)", cs.totalGets, 2);
 		check("…hits", cs.totalHits, 1);
 		const msgs2 = convertMessages([userText("q"), assistantText("Uncached answer.")]);
-		const aux = provider.attachReasoningToHistory(msgs2, false);
-		checkDeep("auxiliary request still attaches", aux, { hits: 0, misses: 1 });
+		let auxiliaryMissing;
+		try { provider.attachReasoningToHistory(msgs2, false); } catch (error) { auxiliaryMissing = error; }
+		checkMatch("tool-enabled auxiliary history cannot fabricate originals", auxiliaryMissing?.message, /original assistant reasoning is unavailable/);
 		check("…but stats unchanged (countStats=false)", provider.getCacheStats().totalGets, 2);
 		check("pre-existing reasoning_content is kept, not re-looked-up", (() => { const m = [{ role: "assistant", content: "x", reasoning_content: "keep" }]; provider.attachReasoningToHistory(m); return m[0].reasoning_content; })(), "keep");
 		checkMatch("miss is logged with the fingerprint", output.text(), /cache\.MISS.*"mode":"tx"/);
+		checkMatch("error explains original unavailable and guidance", shim.calls.showErrorMessage.at(-1)?.message, /original assistant reasoning is unavailable.*Start a new chat.*Show Log/);
 		provider.dispose();
 	}
 
@@ -112,6 +115,93 @@ async function main() {
 		check("non-thinking turn: no error", t.error, undefined);
 		check("non-thinking body carries no reasoning_content", String(t.captured.body).includes("reasoning_content"), false);
 		check("thinking disabled on the wire", String(t.captured.body).includes('"thinking":{"type":"disabled"}'), true);
+		provider.dispose();
+	}
+	// --- no-tool thinking ignores reasoning, but preserves it for later tools ---
+	{
+		shim.reset();
+		const { provider } = makeProvider();
+		const first = await runTurn(provider, { chunks: [reasoningChunk("original"), contentChunk("answer"), finishChunk("stop"), DONE] });
+		const answer = first.progress.texts().join("");
+		const history = [userText("q"), assistantText(answer), userText("next")];
+		const before = provider.getCacheStats().totalGets;
+		const noTools = await runTurn(provider, { messages: history });
+		check("thinking without advertised tools omits reasoning", JSON.parse(noTools.captured.body).messages[1].reasoning_content, undefined);
+		check("no-tool requests do not look up reasoning", provider.getCacheStats().totalGets, before);
+		const withTools = await runTurn(provider, { messages: history, options: { tools: [{ name: "t" }] } });
+		check("later tools restore original from no-tool turn", JSON.parse(withTools.captured.body).messages[1].reasoning_content, "original");
+		const unavailable = [userText("q"), assistantToolCallMsg("", [{ callId: "unknown", name: "t", input: {} }]), toolResultMsg([{ callId: "unknown", content: ["done"] }])];
+		const rejected = (await withConsole("error", () => runTurn(provider, { messages: unavailable, options: { tools: [{ name: "t" }] } }))).result;
+		checkMatch("missing tool-call original fails before network", rejected.error?.message, /original assistant reasoning is unavailable/);
+		check("missing original was not sent", rejected.captured.url, undefined);
+		check("missing original guidance is actionable", shim.calls.showErrorMessage.at(-1)?.items.join(","), "Start New Chat,Show Log");
+		// Eviction/clear of a known nonempty original must not be mistaken for empty.
+		provider._reasoningCache.clear();
+		const lost = (await withConsole("error", () => runTurn(provider, { messages: history, options: { tools: [{ name: "t" }] } }))).result;
+		checkMatch("known nonempty text original loss also fails locally", lost.error?.message, /original assistant reasoning is unavailable/);
+		check("known original loss was not sent", lost.captured.url, undefined);
+		provider.dispose();
+	}
+	// --- completed thinking tools can have a genuinely empty original, including after reload ---
+	{
+		shim.reset();
+		const { provider, memento } = makeProvider();
+		const tools = [{ name: "t" }];
+		await runTurn(provider, { model: model("deepseek-v4-pro::thinking"), options: { tools }, chunks: [toolCallChunk(0, { id: "empty", name: "t", args: "{}" }), finishChunk("tool_calls"), DONE] });
+		await runTurn(provider, { chunks: [contentChunk("completed empty text"), finishChunk("stop"), DONE] });
+		provider.dispose();
+		const second = makeProvider({ memento }).provider;
+		const textHistory = convertMessages([assistantText("completed empty text")]);
+		check("completed thinking text empty original restored after reload", second.attachReasoningToHistory(textHistory).hits, 1);
+		check("completed text original is genuinely empty", textHistory[0].reasoning_content, "");
+		const history = [userText("q"), assistantToolCallMsg("", [{ callId: "empty", name: "t", input: {} }]), toolResultMsg([{ callId: "empty", content: ["done"] }])];
+		const replay = await runTurn(second, { messages: history, options: { tools } });
+		check("known empty completed thinking reasoning does not block continuation", replay.error, undefined);
+		check("only genuinely empty original gets empty string", JSON.parse(replay.captured.body).messages[1].reasoning_content, "");
+		second.dispose();
+	}
+	// --- disabled, incomplete and cancelled no-reasoning streams never invent empty originals ---
+	{
+		shim.reset();
+		const { provider } = makeProvider();
+		for (const [label, turn] of [
+			["disabled", { model: model("deepseek-v4-pro"), chunks: [contentChunk("disabled answer"), finishChunk("stop"), DONE] }],
+			["incomplete", { chunks: [contentChunk("incomplete answer"), DONE] }],
+			["truncated", { chunks: [contentChunk("truncated answer"), finishChunk("length"), DONE] }],
+		]) {
+			await runTurn(provider, turn);
+			check(`${label}: no fabricated empty original`, provider._reasoningCache.size(), 0);
+		}
+		const cancel = cancellation();
+		await runTurn(provider, {
+			chunks: [contentChunk("cancelled answer"), DONE],
+			cancellation: cancel,
+			progress: { report: () => cancel.cancel() },
+		});
+		check("cancelled: no fabricated empty original", provider._reasoningCache.size(), 0);
+		check("unavailable original is not stored as empty", provider._reasoningCache.size(), 0);
+		provider.dispose();
+	}
+	// --- every prior assistant round is restored, including completed rounds ---
+	{
+		shim.reset();
+		const { provider } = makeProvider();
+		const history = [
+			userText("one"),
+			assistantToolCallMsg("", [{ callId: "old", name: "t", input: {} }]),
+			toolResultMsg([{ callId: "old", content: ["done"] }]),
+			assistantText("completed old round"),
+			userText("two"),
+			assistantText("completed new round"),
+			userText("three"),
+		];
+		for (const message of convertMessages(history).filter((m) => m.role === "assistant")) {
+			const fp = fingerprintAssistantTurn({ text: message.content ?? "", toolCalls: (message.tool_calls ?? []).map((call) => ({ id: call.id, name: call.function.name })) });
+			provider._reasoningCache.set(fp, `original:${fp}`);
+		}
+		const replay = await runTurn(provider, { messages: history, options: { tools: [{ name: "t" }] } });
+		check("completed-round replay succeeds", replay.error, undefined);
+		check("all assistants, not just latest round, carry originals", JSON.parse(replay.captured.body).messages.filter((m) => m.role === "assistant").every((m) => m.reasoning_content?.startsWith("original:")), true);
 		provider.dispose();
 	}
 	summary("adapter_provider_reasoning");

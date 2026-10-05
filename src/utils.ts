@@ -3,7 +3,8 @@ import type { OpenAIChatMessage, OpenAIChatRole, OpenAIFunctionToolDef, OpenAITo
 import { toWireName } from "./tool_names";
 import type { ToolChoice } from "./tool_choice";
 import { buildToolPayload } from "./tool_payload";
-import { buildUserContent, type UserContentInput } from "./image_content";
+import { buildUserContent, normalizeImageMime, coerceImageDetail, type UserContentInput } from "./image_content";
+import type { ImageDetail } from "./types";
 
 // Tool-name validation/wire-aliasing live in `./tool_names.ts` and the tool
 // payload assembly (schema sanitization, skip logic, tool_choice) in
@@ -23,9 +24,10 @@ import { buildUserContent, type UserContentInput } from "./image_content";
  */
 export function convertMessages(
 	messages: readonly vscode.LanguageModelChatRequestMessage[],
-	opts?: { imageInput?: boolean }
+	opts?: { imageInput?: boolean; imageDetail?: ImageDetail }
 ): OpenAIChatMessage[] {
 	const imageInput = opts?.imageInput === true;
+	const imageDetail = coerceImageDetail(opts?.imageDetail);
 	const out: OpenAIChatMessage[] = [];
 	for (const m of messages) {
 		const role = mapRole(m);
@@ -43,17 +45,30 @@ export function convertMessages(
 				// turns never legitimately carry them, and DeepSeek only accepts
 				// image blocks on user messages — anywhere else they are dropped
 				// by the role gate below, same as before vision support.
-				contentInputs.push({ kind: "image", mimeType: part.mimeType, data: part.data });
+				contentInputs.push({ kind: "image", mimeType: part.mimeType, data: part.data, detail: imageDetail });
 			} else if (part instanceof vscode.LanguageModelToolCallPart) {
 				const id = part.callId;
 				if (typeof id !== "string" || id.trim().length === 0) {
 					throw new Error("Invalid request: Tool call must have a nonempty callId.");
 				}
-				let args = "{}";
+				let args: string;
 				try {
-					args = JSON.stringify(part.input ?? {});
+					if (!part.input || typeof part.input !== "object" || Array.isArray(part.input)) {
+						throw new Error("not an object");
+					}
+					const serialized = JSON.stringify(part.input);
+					if (typeof serialized !== "string") {
+						throw new Error("not serializable");
+					}
+					const parsed: unknown = JSON.parse(serialized);
+					if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+						throw new Error("not an object");
+					}
+					args = serialized;
 				} catch {
-					args = "{}";
+					throw new Error(
+						"Invalid request: historical tool arguments must be a JSON-serializable object. Start a new chat or inspect the tool integration; arguments were not sent."
+					);
 				}
 				// History tool calls carry HOST names (the reverse-mapped names
 				// we reported to VS Code); re-alias them so the API sees the
@@ -116,12 +131,28 @@ export function convertMessages(
  * checked here — unsupported images must reach buildUserContent so they are
  * counted and warned about, not silently ignored as unknown parts.
  */
-function isImageDataPart(value: unknown): value is { mimeType: string; data: Uint8Array } {
+export function isImageDataPart(value: unknown): value is { mimeType: string; data: Uint8Array } {
 	if (!value || typeof value !== "object") {
 		return false;
 	}
 	const obj = value as { mimeType?: unknown; data?: unknown };
-	return typeof obj.mimeType === "string" && obj.mimeType.startsWith("image/") && obj.data instanceof Uint8Array;
+	return typeof obj.mimeType === "string" && normalizeImageMime(obj.mimeType).startsWith("image/") && obj.data instanceof Uint8Array;
+}
+
+/** Collect user attachments without allocating base64 strings. */
+export function collectUserImageInputs(messages: readonly vscode.LanguageModelChatRequestMessage[]): UserContentInput[] {
+	const inputs: UserContentInput[] = [];
+	for (const message of messages) {
+		if (message.role !== vscode.LanguageModelChatMessageRole.User) {
+			continue;
+		}
+		for (const part of message.content ?? []) {
+			if (isImageDataPart(part)) {
+				inputs.push({ kind: "image", mimeType: part.mimeType, data: part.data });
+			}
+		}
+	}
+	return inputs;
 }
 
 /**

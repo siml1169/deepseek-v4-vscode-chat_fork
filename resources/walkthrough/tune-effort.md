@@ -1,21 +1,24 @@
 # Tune reasoning effort
 
-Thinking variants accept two effort levels via the
+Thinking variants accept three effort levels via the
 `deepseekv4.reasoningEffort` setting:
 
 | Value | Behavior |
 |---|---|
-| **`max`** (default) | Deepest reasoning chain. Best for agent tasks, refactors, complex bug hunts. Uses the most reasoning tokens. |
-| **`high`** | Shorter reasoning chain, faster responses, lower cost. Good for everyday chat and simple Q&A. |
+| **`low`** | Lighter reasoning for lower latency. |
+| **`high`** (default) | Balanced reasoning, matching the API default. |
+| **`max`** | Deepest reasoning chain. Best for complex agent tasks, refactors, and bug hunts. Uses the most reasoning tokens. |
 
 The setting is read at request time, so changes take effect on the **next
 message** — no reload required.
 
 ## When to switch
 
-- Stay on `max` if you mostly use Copilot Chat in agent mode with tools.
-- Switch to `high` if you find yourself in long Q&A conversations where
-  the reasoning chains feel longer than necessary.
+- Use `high` for everyday work and `max` for harder tasks.
+- Switch to `low` when response latency matters more than reasoning depth.
+
+Existing explicit settings remain unchanged. Documented aliases map
+`minimal` to `low`, `medium`/`xhigh` to `high`, and `ultra` to `max`.
 
 You can flip between modes any time without changing the model.
 

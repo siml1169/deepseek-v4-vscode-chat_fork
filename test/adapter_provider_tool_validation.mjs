@@ -1,5 +1,6 @@
 import { check, checkMatch, summary, withConsole } from "./helpers/check.mjs";
 import { toWireName } from "../out/tool_names.js";
+import { fingerprintAssistantTurn } from "../out/reasoning_cache.js";
 import {
 	vscode, shim, makeProvider, runTurn, userText, assistantToolCallMsg, toolResultMsg,
 	toolCallChunk, finishChunk, DONE,
@@ -125,6 +126,7 @@ async function main() {
 	{
 		shim.reset();
 		const { provider } = makeProvider();
+		provider._reasoningCache.set(fingerprintAssistantTurn({ text: "", toolCalls: [{ id: "used", name: "a" }] }), "Original reasoning for the historical call.");
 		const t = await quiet(() => runTurn(provider, {
 			messages: [
 				userText("do it"),

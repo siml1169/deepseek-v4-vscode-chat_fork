@@ -33,7 +33,18 @@ for (const callId of ["", " \t", undefined, null, 42]) {
 		}
 	})(), true);
 }
-check("input undefined → '{}'", convertMessages([assistantToolCallMsg("", [{ callId: "c", name: "t", input: undefined }])])[0].tool_calls[0].function.arguments, "{}");
+const circular = { privateValue: "do-not-expose" };
+circular.self = circular;
+for (const input of [undefined, null, 3, "do-not-expose", [], circular, { secret: 1n }, { toJSON: () => undefined }, { toJSON: () => "do-not-expose" }]) {
+	check("invalid historical arguments fail instead of being replaced", (() => {
+		try {
+			convertMessages([assistantToolCallMsg("", [{ callId: "c", name: "t", input }])]);
+			return false;
+		} catch (error) {
+			return /JSON-serializable object.*Start a new chat/.test(error.message) && !error.message.includes("do-not-expose");
+		}
+	})(), true);
+}
 checkMatch("host name is aliased to the wire name", convertMessages([assistantToolCallMsg("", [{ callId: "c", name: "weather.get", input: {} }])])[0].tool_calls[0].function.name, /^weather_get_[0-9a-f]{8}$/);
 check("spec-legal names pass through", convertMessages([assistantToolCallMsg("", [{ callId: "c", name: "read_file", input: {} }])])[0].tool_calls[0].function.name, "read_file");
 
@@ -62,7 +73,8 @@ checkDeep(
 );
 
 // --- images ---
-const png = new Uint8Array([137, 80, 78, 71]);
+const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
+const bmp = Buffer.from("424d3a000000000000003600000028000000010000000100000001001800000000000400000000000000000000000000000000000000ffffff00", "hex");
 {
 	const off = withConsole("warn", () => convertMessages([userImageMsg("look", png)]));
 	checkDeep("vision off: image dropped, text stays a string", off.result, [{ role: "user", content: "look" }]);
@@ -71,13 +83,17 @@ const png = new Uint8Array([137, 80, 78, 71]);
 	checkDeep("vision on: block array with data URL", on, [
 		{ role: "user", content: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: `data:image/png;base64,${Buffer.from(png).toString("base64")}` } }] },
 	]);
-	const bad = withConsole("warn", () => convertMessages([userImageMsg("look", png, "image/bmp")], { imageInput: true }));
+	const bad = withConsole("warn", () => convertMessages([userImageMsg("look", bmp, "image/bmp")], { imageInput: true }));
 	checkDeep("unsupported MIME: dropped, string content", bad.result, [{ role: "user", content: "look" }]);
 	checkMatch("unsupported MIME: warns", bad.lines.join("|"), /unsupported MIME/);
 	checkDeep("vision on, text only: still a plain string", convertMessages([userText("plain")], { imageInput: true }), [{ role: "user", content: "plain" }]);
 	check("image-only user message → single image block", convertMessages([{ role: Role.User, content: [new vscode.LanguageModelDataPart(png, "image/png")] }], { imageInput: true })[0].content.length, 1);
 	checkDeep("images on assistant turns are ignored", convertMessages([{ role: Role.Assistant, content: [new vscode.LanguageModelTextPart("t"), new vscode.LanguageModelDataPart(png, "image/png")] }], { imageInput: true }), [{ role: "assistant", content: "t" }]);
 	check("structural data part (no class) is treated as an image", convertMessages([{ role: Role.User, content: [{ mimeType: "image/png", data: png }] }], { imageInput: true })[0].content[0].type, "image_url");
+	for (const imageDetail of ["low", "high", "original", "auto"]) {
+		check(`image detail ${imageDetail} propagated`, convertMessages([userImageMsg("look", png)], { imageInput: true, imageDetail })[0].content[1].image_url.detail, imageDetail);
+	}
+	check("invalid image detail omitted", convertMessages([userImageMsg("look", png)], { imageInput: true, imageDetail: "invalid" })[0].content[1].image_url.detail, undefined);
 }
 
 // --- a realistic agent history in one call ---
