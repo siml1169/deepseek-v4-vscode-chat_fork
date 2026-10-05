@@ -1,4 +1,4 @@
-import Ajv from "ajv";
+import Ajv, { type ValidateFunction } from "ajv";
 import addFormats from "ajv-formats";
 
 const draft7 = "http://json-schema.org/draft-07/schema";
@@ -18,6 +18,15 @@ const schemaMaps = new Set(["properties", "patternProperties", "definitions"]);
 const schemaValues = new Set([
 	"additionalProperties", "additionalItems", "contains", "propertyNames", "if", "then", "else", "not",
 ]);
+const maxCachedSchemas = 128;
+const maxCachedSchemaBytes = 1024 * 1024;
+interface CompiledSchema {
+	readonly ajv: Ajv;
+	readonly validate: ValidateFunction;
+	readonly bytes: number;
+}
+const compiledSchemas = new Map<string, CompiledSchema>();
+let cachedSchemaBytes = 0;
 
 function snapshot(value: unknown, ancestors = new Set<object>()): unknown {
 	if (value === null || typeof value === "string" || typeof value === "boolean") {
@@ -88,6 +97,13 @@ function checkSupport(schema: unknown, formats: Set<string>, path = "#"): void {
 }
 
 function compileSchema(schema: Record<string, unknown>) {
+	const key = JSON.stringify(schema);
+	const cached = compiledSchemas.get(key);
+	if (cached) {
+		compiledSchemas.delete(key);
+		compiledSchemas.set(key, cached);
+		return cached;
+	}
 	// One instance per schema prevents host $id collisions and offers no remote
 	// resolver: unresolved references fail compilation, without network access.
 	const ajv = new Ajv({
@@ -108,7 +124,26 @@ function compileSchema(schema: Record<string, unknown>) {
 		ajv.addMetaSchema(meta, draft7.replace("http:", "https:"));
 	}
 	try {
-		return { ajv, validate: ajv.compile(schema) };
+		// The advertised snapshot is caller-owned. Compile a private copy so
+		// mutating it cannot alter a cached validator's enum/const references.
+		const compiled: CompiledSchema = {
+			ajv,
+			validate: ajv.compile(JSON.parse(key) as Record<string, unknown>),
+			bytes: Buffer.byteLength(key, "utf8"),
+		};
+		if (compiled.bytes <= maxCachedSchemaBytes) {
+			while (compiledSchemas.size >= maxCachedSchemas || cachedSchemaBytes + compiled.bytes > maxCachedSchemaBytes) {
+				const oldest = compiledSchemas.entries().next().value;
+				if (!oldest) {
+					break;
+				}
+				compiledSchemas.delete(oldest[0]);
+				cachedSchemaBytes -= oldest[1].bytes;
+			}
+			compiledSchemas.set(key, compiled);
+			cachedSchemaBytes += compiled.bytes;
+		}
+		return compiled;
 	} catch (error) {
 		throw new Error(`Invalid tool schema: ${error instanceof Error ? error.message : String(error)}`);
 	}

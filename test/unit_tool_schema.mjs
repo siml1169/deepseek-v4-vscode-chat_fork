@@ -1,5 +1,6 @@
 import { check, checkDeep, checkMatch, summary } from "./helpers/check.mjs";
 import { createToolArgumentValidator, prepareToolSchema } from "../out/tool_schema.js";
+import Ajv from "ajv";
 
 function failure(fn) {
 	try {
@@ -167,5 +168,87 @@ check("compiled validator isolated from later schema mutations", valid(validator
 check("separate schema compile with same $id is independent", valid(createToolArgumentValidator({
 	$id: "https://example.invalid/local", properties: { value: { type: "string" } },
 }), { value: "yes" }), true);
+
+// Instrument the existing compiler to pin reuse/eviction without production
+// telemetry or timing assertions that would be flaky on slower runners.
+const originalCompile = Ajv.prototype.compile;
+let compilationCount = 0;
+Ajv.prototype.compile = function (...args) {
+	compilationCount++;
+	return Reflect.apply(originalCompile, this, args);
+};
+try {
+	const reusable = {
+		title: "cache-reuse-fixture", type: "object",
+		properties: { value: { enum: [{ nested: { flag: true } }] } },
+	};
+	const advertised = prepareToolSchema(reusable);
+	const firstCompilationCount = compilationCount;
+	const originalValidator = createToolArgumentValidator(reusable);
+	for (let i = 0; i < 300; i++) {
+		createToolArgumentValidator(prepareToolSchema(structuredClone(reusable)));
+	}
+	check("identical snapshots share compilation across 300 tools", compilationCount, firstCompilationCount);
+	advertised.properties.value.enum[0].nested.flag = false;
+	check("advertised mutation cannot corrupt cached enum references", valid(originalValidator, { value: { nested: { flag: true } } }), true);
+	check("cached validator retains original constraint", valid(originalValidator, { value: { nested: { flag: false } } }), false);
+	const changedValidator = createToolArgumentValidator(advertised);
+	check("advertised content mutation forces recompilation", compilationCount, firstCompilationCount + 1);
+	check("changed schema uses changed constraint", valid(changedValidator, { value: { nested: { flag: false } } }), true);
+	reusable.properties.value.enum[0].nested.flag = false;
+	const mutatedHostValidator = createToolArgumentValidator(reusable);
+	check("host mutation uses changed content key", valid(mutatedHostValidator, { value: { nested: { flag: true } } }), false);
+	check("old validators stay isolated after host mutation", valid(originalValidator, { value: { nested: { flag: true } } }), true);
+
+	const collisionSchema = (type) => ({
+		$id: "https://example.invalid/cache-root", type: "object",
+		definitions: { child: { $id: "https://example.invalid/cache-child", type } },
+		properties: { value: { $ref: "https://example.invalid/cache-child" } },
+	});
+	const strings = createToolArgumentValidator(collisionSchema("string"));
+	const integers = createToolArgumentValidator(collisionSchema("integer"));
+	check("same root and nested $id do not collide between cached schemas", valid(strings, { value: "string" }) && valid(integers, { value: 1 }), true);
+	check("same $id does not cross-contaminate constraints", valid(strings, { value: 1 }) || valid(integers, { value: "string" }), false);
+	check("cached $id schema remains reusable independently", valid(createToolArgumentValidator(collisionSchema("string")), { value: "string" }), true);
+
+	const oldest = { title: "cache-oldest-fixture", type: "object" };
+	createToolArgumentValidator(oldest);
+	const beforeEntries = compilationCount;
+	for (let i = 0; i < 128; i++) {
+		createToolArgumentValidator({ title: `cache-entry-bound-${i}`, type: "object" });
+	}
+	check("distinct schema contents compile independently", compilationCount, beforeEntries + 128);
+	createToolArgumentValidator(oldest);
+	check("128-entry limit evicts old schemas", compilationCount, beforeEntries + 129);
+
+	const recent = { title: "cache-lru-recent", type: "object" };
+	const lessRecent = { title: "cache-lru-less-recent", type: "object" };
+	createToolArgumentValidator(recent);
+	createToolArgumentValidator(lessRecent);
+	createToolArgumentValidator(recent);
+	for (let i = 0; i < 127; i++) {
+		createToolArgumentValidator({ title: `cache-lru-filler-${i}`, type: "object" });
+	}
+	const beforeLruCheck = compilationCount;
+	createToolArgumentValidator(recent);
+	check("cache hit refreshes recency", compilationCount, beforeLruCheck);
+	createToolArgumentValidator(lessRecent);
+	check("less recently used schema is evicted first", compilationCount, beforeLruCheck + 1);
+
+	const large = { title: "a".repeat(700 * 1024), type: "object" };
+	const anotherLarge = { title: "b".repeat(700 * 1024), type: "object" };
+	createToolArgumentValidator(large);
+	const beforeBytes = compilationCount;
+	createToolArgumentValidator(anotherLarge);
+	createToolArgumentValidator(large);
+	check("schema byte budget evicts entries below count limit", compilationCount, beforeBytes + 2);
+	const tooLarge = { title: "z".repeat(1024 * 1024), type: "object" };
+	const beforeOversize = compilationCount;
+	createToolArgumentValidator(tooLarge);
+	createToolArgumentValidator(tooLarge);
+	check("schemas exceeding byte budget are not retained", compilationCount, beforeOversize + 2);
+} finally {
+	Ajv.prototype.compile = originalCompile;
+}
 
 summary("unit_tool_schema");

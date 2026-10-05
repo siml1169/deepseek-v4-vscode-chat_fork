@@ -152,7 +152,10 @@ without argument coercion, default insertion, or removal of properties.
 Composite schemas and declared numeric types are preserved, not rewritten.
 Unsupported keywords, formats, dialects, and invalid/unresolved schemas
 produce a diagnostic and skip only that tool. Remote references are never
-fetched. Server-side strict mode is not enabled: its current endpoint and
+fetched. Compiled validators use a content-keyed cache bounded by both entry
+count and schema bytes; mutations invalidate the key, and private schema
+copies prevent caller mutations from changing existing validators.
+Server-side strict mode is not enabled: its current endpoint and
 schema subset could not be verified, and local validation does not imply a
 server-side guarantee.
 
