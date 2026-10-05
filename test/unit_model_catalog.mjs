@@ -10,10 +10,10 @@ import { MODEL_VARIANTS, findVariant } from "../out/model_catalog.js";
 const EXPECTED = [
 	["deepseek-v4-pro::thinking", "DeepSeek V4 Pro (thinking)", "deepseek-v4-pro", true, false, 655360, 393216],
 	["deepseek-v4-pro", "DeepSeek V4 Pro", "deepseek-v4-pro", false, false, 983040, 65536],
-	["deepseek-v4-flash::thinking", "DeepSeek V4 Flash (thinking)", "deepseek-v4-flash", true, false, 655360, 393216],
-	["deepseek-v4-flash", "DeepSeek V4 Flash", "deepseek-v4-flash", false, false, 983040, 65536],
-	["deepseek-v4-flash-vision-exp::thinking", "DeepSeek V4 Flash Vision (thinking)", "deepseek-v4-flash-vision-exp", true, true, 655360, 393216],
-	["deepseek-v4-flash-vision-exp", "DeepSeek V4 Flash Vision", "deepseek-v4-flash-vision-exp", false, true, 983040, 65536],
+	["deepseek-v4-flash::thinking", "DeepSeek V4 Flash (thinking)", "deepseek-flash", true, true, 655360, 393216],
+	["deepseek-v4-flash", "DeepSeek V4 Flash", "deepseek-flash", false, true, 983040, 65536],
+	["deepseek-v4-flash-vision-exp::thinking", "DeepSeek V4 Flash Vision (thinking)", "deepseek-flash", true, true, 655360, 393216],
+	["deepseek-v4-flash-vision-exp", "DeepSeek V4 Flash Vision", "deepseek-flash", false, true, 983040, 65536],
 ];
 
 check("exactly six variants", MODEL_VARIANTS.length, 6);

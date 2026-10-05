@@ -31,8 +31,11 @@ export interface OpenAITextContentPart {
  */
 export interface OpenAIImageContentPart {
 	type: "image_url";
-	image_url: { url: string };
+	image_url: { url: string; detail?: ImageDetail };
 }
+
+export type ImageDetail = "low" | "high" | "original" | "auto";
+export type ReasoningEffort = "low" | "high" | "max";
 
 export type OpenAIContentPart = OpenAITextContentPart | OpenAIImageContentPart;
 
@@ -101,14 +104,14 @@ export interface ToolCallBuffer {
  *
  * `reasoning_effort` is no longer a per-variant constant — it is read at
  * request time from the user setting `deepseekv4.reasoningEffort` (values
- * `"high"` | `"max"`, default `"max"`). The setting only takes effect for
+ * `"low"` | `"high"` | `"max"`, default `"high"`). The setting only takes effect for
  * variants where `thinking === true`.
  */
 export interface DeepSeekModelVariant {
 	id: string;
 	displayName: string;
 	tooltip: string;
-	apiModel: "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp";
+	apiModel: "deepseek-v4-pro" | "deepseek-flash";
 	thinking: boolean;
 	/**
 	 * Whether the variant accepts image input (multimodal). Drives the

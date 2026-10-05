@@ -54,8 +54,9 @@ export const MODEL_VARIANTS: DeepSeekModelVariant[] = [
 		id: "deepseek-v4-flash::thinking",
 		displayName: "DeepSeek V4 Flash (thinking)",
 		tooltip: "DeepSeek V4 Flash — cheapest with extended thinking",
-		apiModel: "deepseek-v4-flash",
+		apiModel: "deepseek-flash",
 		thinking: true,
+		vision: true,
 		maxInputTokens: 655360, // 640K (= 1M - 384K output)
 		maxOutputTokens: 393216, // 384K
 	},
@@ -63,22 +64,19 @@ export const MODEL_VARIANTS: DeepSeekModelVariant[] = [
 		id: "deepseek-v4-flash",
 		displayName: "DeepSeek V4 Flash",
 		tooltip: "DeepSeek V4 Flash — cheapest, no extended thinking",
-		apiModel: "deepseek-v4-flash",
+		apiModel: "deepseek-flash",
 		thinking: false,
+		vision: true,
 		maxInputTokens: 983040, // 960K (= 1M - 64K output)
 		maxOutputTokens: 65536, // 64K
 	},
-	// Vision Exp (released 2026-08-21): experimental multimodal variant of
-	// V4 Flash. Same 1M context / 384K output / dual thinking modes / tool
-	// calling as Flash, plus image input (JPEG/PNG/GIF/WebP, sent as base64
-	// data: URLs in content blocks — see image_content.ts). Billed at Flash
-	// prices; images tokenize at up to 384 tokens each. Listed after the
-	// text variants because it's experimental — users opt in via the picker.
+	// Retain legacy Vision picker ids so saved selections survive upgrades.
+	// All Flash entries route to the current multimodal deepseek-flash model.
 	{
 		id: "deepseek-v4-flash-vision-exp::thinking",
 		displayName: "DeepSeek V4 Flash Vision (thinking)",
-		tooltip: "DeepSeek V4 Flash Vision (experimental) — image input, extended thinking",
-		apiModel: "deepseek-v4-flash-vision-exp",
+		tooltip: "DeepSeek Flash — legacy Vision selection, image input, extended thinking",
+		apiModel: "deepseek-flash",
 		thinking: true,
 		vision: true,
 		maxInputTokens: 655360, // 640K (= 1M - 384K output)
@@ -87,8 +85,8 @@ export const MODEL_VARIANTS: DeepSeekModelVariant[] = [
 	{
 		id: "deepseek-v4-flash-vision-exp",
 		displayName: "DeepSeek V4 Flash Vision",
-		tooltip: "DeepSeek V4 Flash Vision (experimental) — image input, no extended thinking",
-		apiModel: "deepseek-v4-flash-vision-exp",
+		tooltip: "DeepSeek Flash — legacy Vision selection, image input, no extended thinking",
+		apiModel: "deepseek-flash",
 		thinking: false,
 		vision: true,
 		maxInputTokens: 983040, // 960K (= 1M - 64K output)

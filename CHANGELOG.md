@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Local tool-argument validation against preserved JSON Schema draft-07 definitions. Unknown or omitted tool names and duplicate call IDs are rejected before dispatch.
+- `deepseekv4.preferredTools` prioritizes exact host tool names within the 128-tool limit while preserving host order. Repeated warnings for consecutive identical oversized tool sets are suppressed.
+- Optional `deepseekv4.imageDetail` (`low`, `high`, `original`, `auto`) and local image count/dimension checks: 600 images/request, 8192 pixels per side, or 4096 with 15 or more images.
+
+### Changed
+
+- All Flash entries use `deepseek-flash` and support images; existing picker IDs are retained. Image planning uses the documented 1024-token ceiling.
+- Thinking effort defaults to `high`, adds `low` and documented aliases, and preserves existing explicit choices. `top_p` is honored only in thinking mode, clamped to 0.95–1.0.
+- Original reasoning is replayed for all prior assistant turns only when thinking and tools are enabled. Tool-less requests omit replay; unavailable original reasoning produces recovery guidance rather than an empty substitute.
+
+### Fixed
+
+- Tool schemas no longer lose composite branches or have numeric types guessed from property names. Invalid or unsupported schemas are diagnosed and skipped, not silently weakened.
+- Historical tool calls require unique nonempty IDs and exactly one matching result; orphaned, duplicate, and mismatched results are rejected. Streamed calls wait for their original nonblank IDs and names rather than inventing replacements.
+- Failed historical argument serialization is rejected rather than replaced with `{}`. Input estimates include transmitted tool results, call arguments, and applicable reasoning. Request-body limits use UTF-8 bytes, and dropped images do not affect limits or estimates.
+
 ## [0.4.1] - 2026-08-25
 
 ### Removed

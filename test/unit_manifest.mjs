@@ -17,7 +17,7 @@ check("name", pkg.name, "deepseek-v4-vscode-chat");
 check("publisher", pkg.publisher, "Laurent00TT");
 check("engines.vscode floor", pkg.engines.vscode, "^1.106.0");
 check("main entry", pkg.main, "./out/extension.js");
-check("zero runtime dependencies", Object.keys(pkg.dependencies ?? {}).length, 0);
+checkDeep("schema and image metadata runtime dependencies", Object.keys(pkg.dependencies ?? {}).sort(), ["ajv", "ajv-formats", "image-size"]);
 
 // --- provider contribution ---
 const providers = pkg.contributes.languageModelChatProviders;
@@ -47,11 +47,16 @@ for (const id of [...pkg.contributes.commands.map((c) => c.command), "deepseekv4
 
 // --- settings ---
 const props = pkg.contributes.configuration.properties;
-checkDeep("settings keys", Object.keys(props).sort(), ["deepseekv4.logRawReasoning", "deepseekv4.reasoningEffort"]);
-checkDeep("reasoningEffort enum", props["deepseekv4.reasoningEffort"].enum, ["high", "max"]);
-check("reasoningEffort default", props["deepseekv4.reasoningEffort"].default, "max");
+checkDeep("settings keys", Object.keys(props).sort(), ["deepseekv4.imageDetail", "deepseekv4.logRawReasoning", "deepseekv4.preferredTools", "deepseekv4.reasoningEffort"]);
+checkDeep("reasoningEffort enum", props["deepseekv4.reasoningEffort"].enum, ["low", "high", "max", "minimal", "medium", "xhigh", "ultra"]);
+check("reasoningEffort default", props["deepseekv4.reasoningEffort"].default, "high");
+checkDeep("imageDetail enum", props["deepseekv4.imageDetail"].enum, ["low", "high", "original", "auto"]);
+check("imageDetail unset by default to preserve API default", props["deepseekv4.imageDetail"].default, undefined);
 check("logRawReasoning type", props["deepseekv4.logRawReasoning"].type, "boolean");
 check("logRawReasoning default", props["deepseekv4.logRawReasoning"].default, false);
+check("preferredTools type", props["deepseekv4.preferredTools"].type, "array");
+check("preferredTools entries are strings", props["deepseekv4.preferredTools"].items.type, "string");
+checkDeep("preferredTools default", props["deepseekv4.preferredTools"].default, []);
 
 // --- persisted keys baked into the compiled output ---
 check("SecretStorage key", extensionJs.includes('"deepseekv4.apiKey"') && providerJs.includes('"deepseekv4.apiKey"'), true);

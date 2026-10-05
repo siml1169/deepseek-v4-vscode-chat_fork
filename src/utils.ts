@@ -3,7 +3,8 @@ import type { OpenAIChatMessage, OpenAIChatRole, OpenAIFunctionToolDef, OpenAITo
 import { toWireName } from "./tool_names";
 import type { ToolChoice } from "./tool_choice";
 import { buildToolPayload } from "./tool_payload";
-import { buildUserContent, type UserContentInput } from "./image_content";
+import { buildUserContent, normalizeImageMime, coerceImageDetail, isSupportedImageData, type UserContentInput } from "./image_content";
+import type { ImageDetail } from "./types";
 
 // Tool-name validation/wire-aliasing live in `./tool_names.ts` and the tool
 // payload assembly (schema sanitization, skip logic, tool_choice) in
@@ -23,9 +24,10 @@ import { buildUserContent, type UserContentInput } from "./image_content";
  */
 export function convertMessages(
 	messages: readonly vscode.LanguageModelChatRequestMessage[],
-	opts?: { imageInput?: boolean }
+	opts?: { imageInput?: boolean; imageDetail?: ImageDetail }
 ): OpenAIChatMessage[] {
 	const imageInput = opts?.imageInput === true;
+	const imageDetail = coerceImageDetail(opts?.imageDetail);
 	const out: OpenAIChatMessage[] = [];
 	for (const m of messages) {
 		const role = mapRole(m);
@@ -43,14 +45,30 @@ export function convertMessages(
 				// turns never legitimately carry them, and DeepSeek only accepts
 				// image blocks on user messages — anywhere else they are dropped
 				// by the role gate below, same as before vision support.
-				contentInputs.push({ kind: "image", mimeType: part.mimeType, data: part.data });
+				contentInputs.push({ kind: "image", mimeType: part.mimeType, data: part.data, detail: imageDetail });
 			} else if (part instanceof vscode.LanguageModelToolCallPart) {
-				const id = part.callId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-				let args = "{}";
+				const id = part.callId;
+				if (typeof id !== "string" || id.trim().length === 0) {
+					throw new Error("Invalid request: Tool call must have a nonempty callId.");
+				}
+				let args: string;
 				try {
-					args = JSON.stringify(part.input ?? {});
+					if (!part.input || typeof part.input !== "object" || Array.isArray(part.input)) {
+						throw new Error("not an object");
+					}
+					const serialized = JSON.stringify(part.input);
+					if (typeof serialized !== "string") {
+						throw new Error("not serializable");
+					}
+					const parsed: unknown = JSON.parse(serialized);
+					if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+						throw new Error("not an object");
+					}
+					args = serialized;
 				} catch {
-					args = "{}";
+					throw new Error(
+						"Invalid request: historical tool arguments must be a JSON-serializable object. Start a new chat or inspect the tool integration; arguments were not sent."
+					);
 				}
 				// History tool calls carry HOST names (the reverse-mapped names
 				// we reported to VS Code); re-alias them so the API sees the
@@ -109,16 +127,44 @@ export function convertMessages(
  * `instanceof vscode.LanguageModelDataPart` — real instances pass it, and so
  * does a part serialized across the extension-host boundary ({mimeType,
  * data}), which instanceof would miss (same reason the cache_control
- * sentinel in collectToolResultText is duck-typed). MIME support is NOT
- * checked here — unsupported images must reach buildUserContent so they are
- * counted and warned about, not silently ignored as unknown parts.
+ * sentinel in collectToolResultText is duck-typed). Declared image parts
+ * reach the builder for validation/drop diagnostics; generic binary parts
+ * are accepted only when their actual bytes identify a supported image.
  */
-function isImageDataPart(value: unknown): value is { mimeType: string; data: Uint8Array } {
+export function isImageDataPart(value: unknown): value is { mimeType: string; data: Uint8Array } {
 	if (!value || typeof value !== "object") {
 		return false;
 	}
 	const obj = value as { mimeType?: unknown; data?: unknown };
-	return typeof obj.mimeType === "string" && obj.mimeType.startsWith("image/") && obj.data instanceof Uint8Array;
+	if (typeof obj.mimeType !== "string" || !(obj.data instanceof Uint8Array)) {
+		return false;
+	}
+	if (normalizeImageMime(obj.mimeType).startsWith("image/")) {
+		return true;
+	}
+	// Generic data parts can also carry images, but must not turn PDFs or
+	// host-control sentinels into image attachments merely because they are bytes.
+	try {
+		return isSupportedImageData(obj.data);
+	} catch {
+		return false;
+	}
+}
+
+/** Collect user attachments without allocating base64 strings. */
+export function collectUserImageInputs(messages: readonly vscode.LanguageModelChatRequestMessage[]): UserContentInput[] {
+	const inputs: UserContentInput[] = [];
+	for (const message of messages) {
+		if (message.role !== vscode.LanguageModelChatMessageRole.User) {
+			continue;
+		}
+		for (const part of message.content ?? []) {
+			if (isImageDataPart(part)) {
+				inputs.push({ kind: "image", mimeType: part.mimeType, data: part.data });
+			}
+		}
+	}
+	return inputs;
 }
 
 /**
@@ -136,6 +182,8 @@ export function convertTools(options: vscode.ProvideLanguageModelChatResponseOpt
 
 /**
  * Validate the request message sequence for correct tool call/result pairing.
+ * Call IDs are unique across the full history; pending calls allow only
+ * consecutive User messages containing matching, single-use tool results.
  * @param messages The full request message list.
  */
 export function validateRequest(messages: readonly vscode.LanguageModelChatRequestMessage[]): void {
@@ -145,41 +193,51 @@ export function validateRequest(messages: readonly vscode.LanguageModelChatReque
 		throw new Error("Invalid request: no messages.");
 	}
 
-	messages.forEach((message, i) => {
-		if (message.role === vscode.LanguageModelChatMessageRole.Assistant) {
-			const toolCallIds = new Set(
-				message.content
-					.filter((part) => part instanceof vscode.LanguageModelToolCallPart)
-					.map((part) => (part as unknown as vscode.LanguageModelToolCallPart).callId)
-			);
-			if (toolCallIds.size === 0) {
-				return;
-			}
+	const seenCallIds = new Set<string>();
+	const pendingCallIds = new Set<string>();
+	const fail = (reason: string): never => {
+		console.error(`[DeepSeek V4] Validation failed: ${reason}`);
+		throw new Error(`Invalid request: ${reason}`);
+	};
+	const missingResult =
+		"Tool call part must be followed by a User message with a LanguageModelToolResultPart with a matching callId.";
 
-			let nextMessageIdx = i + 1;
-			const errMsg =
-				"Invalid request: Tool call part must be followed by a User message with a LanguageModelToolResultPart with a matching callId.";
-			while (toolCallIds.size > 0) {
-				const nextMessage = messages[nextMessageIdx++];
-				if (!nextMessage || nextMessage.role !== vscode.LanguageModelChatMessageRole.User) {
-					console.error("[DeepSeek V4] Validation failed: missing tool result for call IDs:", Array.from(toolCallIds));
-					throw new Error(errMsg);
-				}
-
-				nextMessage.content.forEach((part) => {
-					if (!isToolResultPart(part)) {
-						const ctorName =
-							(Object.getPrototypeOf(part as object) as { constructor?: { name?: string } } | undefined)?.constructor
-								?.name ?? typeof part;
-						console.error("[DeepSeek V4] Validation failed: expected tool result part, got:", ctorName);
-						throw new Error(errMsg);
-					}
-					const callId = (part as { callId: string }).callId;
-					toolCallIds.delete(callId);
-				});
+	for (const message of messages) {
+		const content = message.content ?? [];
+		if (pendingCallIds.size > 0) {
+			if (
+				message.role !== vscode.LanguageModelChatMessageRole.User ||
+				content.length === 0 ||
+				!content.every(isToolResultPart)
+			) {
+				fail(missingResult);
 			}
 		}
-	});
+
+		for (const part of content) {
+			if (part instanceof vscode.LanguageModelToolCallPart) {
+				if (message.role !== vscode.LanguageModelChatMessageRole.Assistant) {
+					fail("Tool call part must belong to an Assistant message.");
+				}
+				const callId = part.callId;
+				if (typeof callId !== "string" || callId.trim().length === 0) {
+					fail("Tool call must have a nonempty callId.");
+				}
+				if (seenCallIds.has(callId)) {
+					fail("Duplicate tool call callId.");
+				}
+				seenCallIds.add(callId);
+				pendingCallIds.add(callId);
+			} else if (part instanceof vscode.LanguageModelToolResultPart || isToolResultPart(part)) {
+				if (message.role !== vscode.LanguageModelChatMessageRole.User || !pendingCallIds.delete(part.callId)) {
+					fail("Tool result must match an outstanding callId exactly once in a User message.");
+				}
+			}
+		}
+	}
+	if (pendingCallIds.size > 0) {
+		fail(missingResult);
+	}
 }
 
 /**

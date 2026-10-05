@@ -151,19 +151,16 @@ export interface CompletedToolCall {
 /**
  * Incremental tool-call assembly, keyed by `tool_calls.index`.
  *
- * Semantics (pinned by unit tests, inherited verbatim from the 0.3.x
- * provider):
- *   - a call completes EARLY, as soon as a name exists and the accumulated
- *     arguments parse as a JSON object — waiting for finish would look like
- *     a hang to the user;
+ * Semantics (pinned by unit tests):
+ *   - a call completes EARLY, as soon as a name and nonblank id exist and
+ *     the accumulated arguments parse as a JSON object — waiting for finish
+ *     would look like a hang to the user;
  *   - once an index has completed, ALL later deltas for it are ignored
  *     (DeepSeek occasionally re-sends fragments);
- *   - `add` requires a name to complete; `flush` substitutes "unknown_tool"
- *     (the asymmetry is deliberate — mid-stream we can afford to wait for
- *     the name, at end-of-stream we can't);
+ *   - missing identity fields wait for later deltas; they are rejected on
+ *     a clean finish and dropped on truncation, never invented;
  *   - `flush(throwOnInvalid=true)` (clean finish) throws on unparseable
  *     args; `flush(false)` ([DONE] / truncation) drops them silently;
- *   - a missing id is replaced with `call_<random>` at completion time.
  */
 export class ToolCallAssembler {
 	private readonly buffers = new Map<number, { id?: string; name?: string; args: string }>();
@@ -193,7 +190,7 @@ export class ToolCallAssembler {
 
 			// Complete immediately once arguments become valid JSON to avoid
 			// perceived hanging
-			if (!buf.name) {
+			if (!buf.name || !buf.id?.trim()) {
 				continue;
 			}
 			const canParse = tryParseJSONObject(buf.args);
@@ -201,7 +198,7 @@ export class ToolCallAssembler {
 				continue;
 			}
 			completed.push({
-				id: buf.id ?? `call_${Math.random().toString(36).slice(2, 10)}`,
+				id: buf.id,
 				name: buf.name,
 				args: canParse.value,
 			});
@@ -227,9 +224,16 @@ export class ToolCallAssembler {
 				// When not throwing (e.g. on [DONE]), drop silently to reduce noise
 				continue;
 			}
+			if (!buf.id?.trim() || !buf.name) {
+				if (throwOnInvalid) {
+					throw new Error("Missing tool call ID or name");
+				}
+				this.buffers.delete(idx);
+				continue;
+			}
 			completed.push({
-				id: buf.id ?? `call_${Math.random().toString(36).slice(2, 10)}`,
-				name: buf.name ?? "unknown_tool",
+				id: buf.id,
+				name: buf.name,
 				args: parsed.value,
 			});
 			this.buffers.delete(idx);

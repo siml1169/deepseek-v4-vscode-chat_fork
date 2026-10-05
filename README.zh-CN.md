@@ -23,37 +23,41 @@
 | ------ | ------ | :---: | :---: | ------ | ------ |
 | DeepSeek V4 Pro (thinking) | `deepseek-v4-pro` | ✓ | — | 640K | 384K |
 | DeepSeek V4 Pro | `deepseek-v4-pro` | — | — | 960K | 64K |
-| DeepSeek V4 Flash (thinking) | `deepseek-v4-flash` | ✓ | — | 640K | 384K |
-| DeepSeek V4 Flash | `deepseek-v4-flash` | — | — | 960K | 64K |
-| DeepSeek V4 Flash Vision (thinking) | `deepseek-v4-flash-vision-exp` | ✓ | ✓ | 640K | 384K |
-| DeepSeek V4 Flash Vision | `deepseek-v4-flash-vision-exp` | — | ✓ | 960K | 64K |
+| DeepSeek V4 Flash (thinking) | `deepseek-flash` | ✓ | ✓ | 640K | 384K |
+| DeepSeek V4 Flash | `deepseek-flash` | — | ✓ | 960K | 64K |
+| DeepSeek V4 Flash Vision (thinking) | `deepseek-flash` | ✓ | ✓ | 640K | 384K |
+| DeepSeek V4 Flash Vision | `deepseek-flash` | — | ✓ | 960K | 64K |
 
 **(thinking)** 变体会先在隐藏的思维链里推理再作答 —— 更慢、更费 token，但更擅长难题和 Agent 任务；不带后缀的变体直接作答。所有变体共享 DeepSeek V4 的 1M token 上下文（输入 + 输出）；thinking 变体为输出预留 384K，以免长推理链被截断。
 
+选择器 ID 和已保存的模型选择保持不变。所有 Flash 和旧 Flash Vision 条目均使用当前的 `deepseek-flash` API 模型，并支持图片；Pro 路由不变。
+
 ## 你能得到什么
 
-- 扩展思考，深度可选（`high` / `max`），推理链跨多轮 Agent 循环保留
+- 扩展思考，深度可选（`low` / `high` / `max`），推理链跨多轮 Agent 循环保留
 - Agent 模式工具调用，长多轮循环照常工作 —— 工具结果和模型自己的推理逐轮带下去
-- Vision 变体原生支持图片输入
+- 所有 Flash 变体原生支持图片输入
 - 状态栏实时显示账户余额（自动识别 CNY / USD）；悬浮层另有本次会话花费
 - 上下文窗口用量接入 Copilot Chat 原生指示器（需 VS Code 1.120+）
 - 带处理建议的错误提示（400 / 401 / 402 / 422 / 429），临时故障自动重试
 - 首次运行演练（Walkthrough）；未设密钥时选择器条目显示警告而不是消失
 
-## 图片（Vision 变体）
+## 图片（Flash 变体）
 
-选一个 **Flash Vision** 变体，在 Copilot Chat 里附加图片即可；思考和工具调用与 Flash 完全一致。
+选任意 **Flash** 变体，在 Copilot Chat 里附加图片即可；图片输入可与思考和工具调用一起使用。
 
 - 格式：JPEG、PNG、GIF、WebP。其他附件 —— 以及发给纯文本变体的图片 —— 都会被丢弃，绝不会由其他模型转述。
-- 限制：每个请求 48 MiB（base64 计入）、单张图片 32 MiB，两者都在发送前本地检查。
-- 费用：每张图片最多 384 tokens，按 Flash 价格计费。
-- `-exp` 表示 DeepSeek 侧仍是实验性模型（[发布说明，2026-08-21](https://api-docs.deepseek.com/news/news260821/)），偶有毛边属正常。
+- 限制：UTF-8 JSON 请求体最大 48 MiB（base64 计入），单张内联图片最大 32 MiB，每次请求最多 600 张图片。每边最大 8192 像素；请求含 15 张或更多图片时降为 4096。检查范围包括历史中实际发送的图片。
+- 费用：按分辨率计算，每张最多 1024 tokens；本地估算使用此上限，实际用量以 API 返回为准。
+- `deepseekv4.imageDetail` 支持 `low`、`high`、`original`、`auto`。未显式设置时省略该字段，使用 API 的 `original` 默认值。
+- 图片格式按实际字节识别，不依赖声明的 MIME 类型。元数据损坏时拒绝并提示重新导出；不支持的格式会丢弃并给出诊断。
+- 暂不支持外部图片 URL 或 Files API 引用。文档规定工具结果中不支持图片。
 
 ## 为什么要原生 provider？
 
 通用的 OpenAI 兼容桥接器为 DeepSeek V4 做不到的两件事：
 
-- **推理往返。** DeepSeek thinking 模式期望下一次请求带回每个先前 assistant 轮的 `reasoning_content` —— 不带就硬性 400，直到 2026-08-22 的一次实测发现服务端已放宽（文档仍保留该规则）—— 而 VS Code 的聊天历史没有这个字段。本扩展把它缓存在本地，并在每次请求时重新附加到历史里的 assistant 轮上：模型在 Agent 多轮里保有自己的思维链，每次请求也与 DeepSeek 已缓存的内容字节级一致，从而一直享受更便宜的缓存命中输入价。
+- **推理往返。** 带工具的 thinking 请求必须回传所有先前 assistant 轮的原始 `reasoning_content`，包括没有工具调用的轮次和已完成的用户问题。VS Code 历史不含此字段，本扩展在本地缓存它。未发送工具定义时省略历史推理，因为 API 会忽略它。原始推理缺失时给出诊断，而不是用空字符串冒充完整回传。
 - **真实费用，不是估算。** 余额与会话花费来自 DeepSeek 的 `/user/balance`；缓存命中 / 未命中 token 来自真实的 `usage` 数据。
 
 ## 命令
@@ -72,7 +76,8 @@
 
 | 设置项 | 取值 | 默认 | 说明 |
 | ------ | ------ | ------ | ------ |
-| `deepseekv4.reasoningEffort` | `high` \| `max` | `max` | `(thinking)` 变体的推理深度，其他变体忽略。`high` 更快、推理链更短。下一条消息即生效。 |
+| `deepseekv4.reasoningEffort` | `low` \| `high` \| `max` 及文档中的别名 | `high` | 仅影响 thinking 变体，保留已有显式配置。`minimal` → `low`，`medium`/`xhigh` → `high`，`ultra` → `max`。 |
+| `deepseekv4.imageDetail` | `low` \| `high` \| `original` \| `auto` | 未设置（API：`original`） | Flash 图片处理精度，未显式设置时不发送字段。 |
 | `deepseekv4.logRawReasoning` | `boolean` | `false` | 把原始 `reasoning_content` 流式写入日志（只在排查缓存击穿时有用）。可能捕获私有代码 —— 分享日志时请保持**关闭**。 |
 
 ## 计费与 Copilot 高级请求配额
@@ -90,7 +95,7 @@
 ## 常见问题
 
 **报错 `The reasoning_content in the thinking mode must be passed back to the API`（400）。**
-2026-08-22 的一次实测之后没再见过（API 接受了所有不带推理的历史形态），但文档仍保留该规则。若出现，说明某个 assistant 轮在缓存里没有推理内容（安装扩展前的历史、缓存被清空、或超长会话中被淘汰）：新开会话即可；*Show DeepSeek V4 Reasoning Cache Stats* 可诊断。
+带工具的 thinking 请求必须保留原始推理。若历史来自其他模型、缓存已清空或内容已淘汰，请新开会话、禁用工具或选择不带 thinking 的变体。*Show DeepSeek V4 Reasoning Cache Stats* 可诊断；空占位符不等同于原始推理。
 
 **弹出警告 "prompt cache hit rate dropped"。**
 你这个会话在 DeepSeek 服务端的缓存前缀断了，后续轮次按全价（缓存未命中）输入价计费，而不是更便宜的缓存命中价。扩展无法判断具体原因 —— 某轮中途取消或失败、超长会话中被淘汰、编辑器重启都有可能。点 *Start New Chat* 新开会话即可止损；*Show Cache Stats* 可诊断。背景：[#19](https://github.com/Laurent00TT/deepseek-v4-vscode-chat/issues/19)。
@@ -99,7 +104,7 @@
 升级到 VS Code **1.120+** —— 更早的宿主不会为扩展提供的模型显示用量（[#18](https://github.com/Laurent00TT/deepseek-v4-vscode-chat/issues/18)、[microsoft/vscode#315394](https://github.com/microsoft/vscode/issues/315394)）。
 
 **我附加的图片被忽略了。**
-只有 Flash Vision 变体会发送图片。检查格式和上文的 48 MiB / 32 MiB 限制。
+所有 Flash 变体都会发送受支持的图片，Pro 不支持图片。检查格式、尺寸、数量和上文的 48 MiB / 32 MiB 限制。
 
 **为什么不支持 OpenRouter / 自定义 base URL？**
 有意为之（[#4](https://github.com/Laurent00TT/deepseek-v4-vscode-chat/issues/4)）：OpenRouter 会改写 DeepSeek 的 thinking 协议（`reasoning_details` 而非 `reasoning_content`、不同的 thinking 开关、没有缓存命中计数）—— 恰好是本扩展依赖的东西。要走 OpenRouter，请改用专门的 provider，例如 [ostash/openrouter-chat-provider](https://github.com/ostash/openrouter-chat-provider)。

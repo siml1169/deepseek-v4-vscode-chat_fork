@@ -3,7 +3,7 @@
  * reasoning_cache misses. Lives in its own file (zero vscode dependency)
  * so the unit test can import it via Node ESM without mocking VS Code.
  *
- * Causal chain: reasoning_cache miss → empty reasoning_content stub →
+ * Causal chain: reasoning_cache miss → unavailable original reasoning →
  * broken prefix → server prompt cache collapses on this turn.
  *
  * We gate on `reasoningMissesThisTurn > 0` rather than raw hit-rate

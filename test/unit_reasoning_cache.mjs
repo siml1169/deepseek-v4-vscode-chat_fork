@@ -118,13 +118,35 @@ console.log("Case 5: cache set/get round trip and stats");
 
 	cache.set("", "orphan");
 	cache.set("tx:key", "");
-	assertEq("empty fp / empty reasoning are no-ops", cache.size(), 1);
+	assertEq("empty fp is ignored but genuine empty reasoning is retained", cache.size(), 2);
+	assertEq("genuine empty reasoning differs from unavailable", cache.get("tx:key"), "");
 
 	// Hits: the round-trip get + the post-update get. The empty-fp get is
 	// rejected before stats counting; the unknown-fp get is the one miss.
 	const stats = cache.stats();
-	assertEq("stats counts hits", stats.totalHits, 2);
+	assertEq("stats counts hits including genuine empty reasoning", stats.totalHits, 3);
 	assertEq("stats counts misses", stats.totalMisses, 1);
+}
+
+console.log("");
+console.log("Case 5a: empty originals persist, replace and obey LRU limits");
+{
+	const cache = new ReasoningCache(2);
+	cache.set("tx:empty", "");
+	cache.set("tx:full", "reasoning");
+	const restored = new ReasoningCache(2);
+	restored.restore([...cache.serialize(), { fingerprint: "", reasoning: "" }, { fingerprint: "tx:invalid", reasoning: undefined }]);
+	assertEq("empty original survives serialize/restore", restored.get("tx:empty"), "");
+	assertEq("invalid restore rows do not replace valid originals", restored.size(), 2);
+	assertEq("empty-original hit is counted", restored.stats().totalHits, 1);
+	assertEq("empty-original bytes do not inflate accounting", restored.stats().totalBytes, Buffer.byteLength("reasoning"));
+	restored.set("tx:third", "");
+	assertEq("empty-original lookup retains LRU semantics", restored.get("tx:full"), undefined);
+	restored.set("tx:empty", "replacement");
+	assertEq("nonempty original replaces empty", restored.get("tx:empty"), "replacement");
+	restored.set("tx:empty", "");
+	assertEq("empty original replaces nonempty", restored.get("tx:empty"), "");
+	assertEq("replacement does not duplicate cache keys", restored.size(), 2);
 }
 
 console.log("");

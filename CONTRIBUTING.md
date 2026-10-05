@@ -37,8 +37,10 @@ it silently costs users money or orphans their persisted state.
    splitting, the exact `data: ` prefix, exact `[DONE]` matching,
    only-JSON.parse-errors-are-malformed. A "spec-correct" SSE parser is a
    silent protocol change. Pinned by `test/unit_sse.mjs`.
-5. **Zero runtime dependencies.** The package ships ~130 KB with no
-   supply-chain surface. Don't add a runtime dep to save twenty lines.
+5. **Minimal runtime dependencies.** Tool-schema validation uses Ajv and
+   its standard-format support rather than a partial hand-written validator.
+   Don't add runtime dependencies to save twenty lines; justify additions
+   and check their advisories and packaged runtime files.
 6. **No telemetry, no third-party routing.** The only network peer is
    `api.deepseek.com`. Images are never proxied through another model; the
    README's privacy section is a commitment, not a description.

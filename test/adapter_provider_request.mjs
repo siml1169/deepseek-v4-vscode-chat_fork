@@ -3,6 +3,10 @@
 // API error → notification mapping, and the usage pipeline (estimator EMA,
 // usage DataPart gating, cache-breakdown warning, context nudge hysteresis).
 import { check, checkMatch, summary, withConsole } from "./helpers/check.mjs";
+import { toWireName } from "../out/tool_names.js";
+import { fingerprintAssistantTurn } from "../out/reasoning_cache.js";
+import { countHistoryChars, countToolChars } from "../out/input_accounting.js";
+import sharp from "sharp";
 import {
 	vscode,
 	shim,
@@ -13,9 +17,12 @@ import {
 	textMsg,
 	assistantText,
 	userImageMsg,
+	assistantToolCallMsg,
+	toolResultMsg,
 	jsonResponse,
 	onFetch,
 	contentChunk,
+	toolCallChunk,
 	finishChunk,
 	usageChunk,
 	DONE,
@@ -49,6 +56,82 @@ async function main() {
 		check("Content-Type json", t.captured.headers["Content-Type"], "application/json");
 		check("reasoning_effort read from settings", String(t.captured.body).includes('"reasoning_effort":"high"'), true);
 		check("model id on the wire is the API name", String(t.captured.body).startsWith('{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]'), true);
+		provider.dispose();
+	}
+	// --- tool cap applies to the advertised set, without failing the turn ---
+	for (const required of [false, true]) {
+		for (const count of [0, 1, 127, 128, 129, 300]) {
+			shim.reset();
+			const { provider, output } = makeProvider();
+			const tools = Array.from({ length: count }, (_, i) => ({ name: `tool_${i}` }));
+			const t = await runTurn(provider, {
+				options: { tools, toolMode: required ? vscode.LanguageModelChatToolMode.Required : vscode.LanguageModelChatToolMode.Auto },
+				chunks: ok({ prompt_tokens: 10, completion_tokens: 1 }),
+			});
+			const label = `${count} tools (${required ? "required" : "auto"})`;
+			check(`${label}: turn succeeds`, t.error, undefined);
+			check(`${label}: one request, no retry`, t.captured.attempts, 1);
+			const body = JSON.parse(t.captured.body);
+			check(`${label}: advertised count`, body.tools?.length ?? 0, Math.min(count, 128));
+			check(`${label}: host order preserved`, body.tools?.map((tool) => tool.function.name).join(","), tools.slice(0, 128).map((tool) => tool.name).join(",") || undefined);
+			const choice = count === 0 ? undefined : required ? count === 1 ? { type: "function", function: { name: "tool_0" } } : "required" : "auto";
+			check(`${label}: tool_choice preserved`, JSON.stringify(body.tool_choice), JSON.stringify(choice));
+			check(`${label}: warning only when capped`, shim.calls.showWarningMessage.length, count > 128 ? 1 : 0);
+			check(`${label}: cap logged only when needed`, output.text().includes("request.tools_limited"), count > 128);
+			if (count > 128) {
+				checkMatch(`${label}: warning explains omitted tools and remedy`, shim.calls.showWarningMessage[0]?.message, /tools are unavailable.*Configure Tools.*MCP servers/);
+				checkMatch(`${label}: original and advertised counts logged`, output.text(), new RegExp(`"available":${count},"advertised":128`));
+			}
+			check(`${label}: caller's tools unchanged`, tools.length, count);
+			provider.dispose();
+		}
+	}
+	for (const usable of [125, 129]) {
+		shim.reset();
+		const { provider } = makeProvider();
+		const tools = [
+			...Array.from({ length: 5 }, () => ({ name: "" })),
+			{ name: "mcp.weather.get" },
+			...Array.from({ length: usable - 1 }, (_, i) => ({ name: `tool_${i}` })),
+		];
+		const t = await quiet(() => runTurn(provider, {
+			options: { tools, toolMode: vscode.LanguageModelChatToolMode.Required },
+			chunks: [toolCallChunk(0, { id: "call_cap", name: toWireName("mcp.weather.get"), args: "{}" }), finishChunk("tool_calls"), DONE],
+		}));
+		check(`${usable} usable tools: turn succeeds after skipping invalid names`, t.error, undefined);
+		const body = JSON.parse(t.captured.body);
+		check(`${usable} usable tools: skips happen before capping`, body.tools.length, Math.min(usable, 128));
+		check(`${usable} usable tools: required mode preserved`, body.tool_choice, "required");
+		check(`${usable} usable tools: aliased name retained`, body.tools[0].function.name, toWireName("mcp.weather.get"));
+		check(`${usable} usable tools: wire call maps back to host`, t.progress.toolCalls()[0]?.name, "mcp.weather.get");
+		check(`${usable} usable tools: warning based on advertised count`, shim.calls.showWarningMessage.length, usable > 128 ? 1 : 0);
+		provider.dispose();
+	}
+	// --- explicit preferences and repeated agent-turn warnings ---
+	{
+		shim.reset();
+		shim.answers.getConfiguration = { deepseekv4: { preferredTools: ["mcp.tool.139"] } };
+		const { provider, output } = makeProvider();
+		const tools = Array.from({ length: 140 }, (_, i) => ({ name: `mcp.tool.${i}` }));
+		const turn = () => runTurn(provider, {
+			options: { tools },
+			chunks: [toolCallChunk(0, { id: "preferred", name: toWireName("mcp.tool.139"), args: "{}" }), finishChunk("tool_calls"), DONE],
+		});
+		const first = await turn();
+		check("preferred tool beyond first 128 remains usable", first.error, undefined);
+		const selected = JSON.parse(first.captured.body).tools;
+		check("preferred tool advertised with stable host order", selected.at(-1).function.name, toWireName("mcp.tool.139"));
+		check("earlier nonpreferred tool fills remaining space", selected[126].function.name, toWireName("mcp.tool.126"));
+		check("preferred call reverse-mapped", first.progress.toolCalls()[0]?.name, "mcp.tool.139");
+		await turn();
+		check("same capped set warns only once", shim.calls.showWarningMessage.length, 1);
+		check("each capped request still logs diagnostics", output.text().split("request.tools_limited").length - 1, 2);
+		shim.answers.getConfiguration = { deepseekv4: { preferredTools: ["mcp.tool.138", "mcp.tool.139"] } };
+		await turn();
+		check("changed preference warns again", shim.calls.showWarningMessage.length, 2);
+		await runTurn(provider, { options: { tools: tools.slice(0, 2) } });
+		await turn();
+		check("returning to capped tools after uncapped set warns", shim.calls.showWarningMessage.length, 3);
 		provider.dispose();
 	}
 	// --- missing API key ---
@@ -92,6 +175,7 @@ async function main() {
 		// image bytes takes a couple of seconds. It is the only way to cross the
 		// real 48 MiB body guard, so it stays — just don't be surprised by the pause.
 		const img = new Uint8Array(16 * 1024 * 1024);
+		img.set(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64"));
 		const t = await quiet(() =>
 			runTurn(provider, {
 				model: model("deepseek-v4-flash-vision-exp"),
@@ -103,6 +187,82 @@ async function main() {
 		provider.dispose();
 	}
 	// --- API error mapping (non-retryable statuses) ---
+	// --- accepted-image statistics, detail coercion and whole-history limits ---
+	{
+		const png = await sharp({ create: { width: 1, height: 1, channels: 3, background: "white" } }).png().toBuffer();
+		const bmp = Buffer.from("424d3a000000000000003600000028000000010000000100000001001800000000000400000000000000000000000000000000000000ffffff00", "hex");
+		for (const [configured, expected] of [["low", "low"], ["auto", "auto"], ["high", "high"], ["original", "original"], ["invalid", undefined], [undefined, undefined]]) {
+			shim.reset();
+			shim.answers.getConfiguration = { deepseekv4: { imageDetail: configured } };
+			const { provider } = makeProvider();
+			const turn = await runTurn(provider, { model: model("deepseek-v4-flash"), messages: [userImageMsg("look", png)] });
+			check(`image detail ${configured}: sent enum`, JSON.parse(turn.captured.body).messages[0].content[1].image_url.detail, expected);
+			check(`image detail ${configured}: supported image budget`, provider.contextUsage.getSnapshot().estimatedMessageTokens, Math.ceil(4 / 3) + 1024);
+			provider.dispose();
+		}
+		const wide = await sharp({ create: { width: 8193, height: 1, channels: 3, background: "white" } }).png().toBuffer();
+		const medium = await sharp({ create: { width: 4097, height: 1, channels: 3, background: "white" } }).png().toBuffer();
+		{
+			shim.reset();
+			const { provider } = makeProvider();
+			const turn = await runTurn(provider, { model: model("deepseek-v4-flash"), messages: [userImageMsg("look", png, "application/octet-stream")] });
+			check("generic declaration actual PNG sent", JSON.parse(turn.captured.body).messages[0].content[1].image_url.url.startsWith("data:image/png;base64,"), true);
+			check("generic declaration image included in preflight accounting", provider.contextUsage.getSnapshot().estimatedMessageTokens, Math.ceil(4 / 3) + 1024);
+			provider.dispose();
+		}
+		for (const [label, messages, regex] of [
+			["single dimension", [userImageMsg("wide", wide)], /8192 pixels/],
+			["many-image dimension", [userImageMsg("medium", medium), ...Array.from({ length: 14 }, () => userImageMsg("small", png))], /4096 pixels/],
+			["whole-history count", Array.from({ length: 601 }, () => userImageMsg("small", png)), /at most 600/],
+		]) {
+			shim.reset();
+			const { provider } = makeProvider();
+			const turn = await quiet(() => runTurn(provider, { model: model("deepseek-v4-flash"), messages }));
+			checkMatch(`${label}: rejected locally`, turn.error?.message, regex);
+			check(`${label}: nothing sent`, turn.captured.url, undefined);
+			provider.dispose();
+		}
+		shim.reset();
+		const { provider } = makeProvider();
+		const turn = (await withConsole("warn", () => runTurn(provider, {
+			model: model("deepseek-v4-flash"),
+			messages: [userImageMsg("medium", medium), ...Array.from({ length: 13 }, () => userImageMsg("small", png)), userImageMsg("ignored", bmp, "image/bmp")],
+		}))).result;
+		check("unsupported fifteenth image does not tighten dimension limit", turn.error, undefined);
+		check("supported images actually sent are counted", provider.contextUsage.getSnapshot().estimatedMessageTokens, Math.ceil((6 + 13 * 5 + 7) / 3) + 14 * 1024);
+		provider.dispose();
+	}
+	// --- serialized body limit is UTF-8 bytes, not JavaScript characters ---
+	{
+		shim.reset();
+		const { provider, output } = makeProvider();
+		const turn = await quiet(() => runTurn(provider, { model: { ...model("deepseek-v4-pro::thinking"), maxInputTokens: 100_000_000 }, messages: [userText("界".repeat(17 * 1024 * 1024))] }));
+		checkMatch("multibyte text exceeds byte cap below character cap", turn.error?.message, /48 MiB limit/);
+		check("multibyte body rejected before network", turn.captured.url, undefined);
+		checkMatch("byte size logged, not code-unit length", output.text(), /request\.too_large.*"bytes":53[0-9]{6}/);
+		provider.dispose();
+	}
+	// --- estimates and EMA use the same transmitted-history accounting ---
+	{
+		shim.reset();
+		const { provider } = makeProvider();
+		const tools = [{ name: "t" }];
+		const history = [textMsg(99, "system"), userText("user"), assistantToolCallMsg("assistant", [{ callId: "account", name: "t", input: { text: "historical argument" } }]), toolResultMsg([{ callId: "account", content: ["tool-result-text"] }])];
+		provider._reasoningCache.set(fingerprintAssistantTurn({ text: "assistant", toolCalls: [{ id: "account", name: "t" }] }), "original reasoning");
+		const first = await runTurn(provider, { messages: history, options: { tools } });
+		const body = JSON.parse(first.captured.body);
+		const historyChars = countHistoryChars(body.messages);
+		const toolChars = countToolChars(body.tools);
+		check("preflight includes tool results, historical args and required reasoning", provider.contextUsage.getSnapshot().estimatedMessageTokens, Math.ceil(historyChars / 3));
+		check("advertised schema preflight uses same accounting", provider.contextUsage.getSnapshot().estimatedToolTokens, Math.ceil(toolChars / 3));
+		await runTurn(provider, { messages: history, options: { tools }, chunks: ok({ prompt_tokens: (historyChars + toolChars) / 2, completion_tokens: 1 }) });
+		check("EMA calibrated from same complete wire text", provider._charsPerToken.toFixed(2), "2.70");
+		const noTools = await runTurn(provider, { messages: history });
+		const stripped = JSON.parse(noTools.captured.body);
+		check("no-tool accounting excludes historical reasoning", provider.contextUsage.getSnapshot().estimatedMessageTokens, Math.ceil(countHistoryChars(stripped.messages) / 2.7));
+		check("default configured reasoning effort is high", stripped.reasoning_effort, "high");
+		provider.dispose();
+	}
 	const cases = [
 		{
 			status: 400,
@@ -217,19 +377,18 @@ async function main() {
 		check("session request counter advanced", provider._sessionRequestCount, 3);
 		provider.dispose();
 	}
-	// --- cache-breakdown warning: peak ≥ 70% then ≤ 20% with ≥ 1 reasoning miss ---
+	// --- missing originals stop locally rather than causing a server cache breakdown ---
 	{
 		shim.reset();
-		shim.answers.showWarningMessage = "Show Cache Stats";
 		const { provider } = makeProvider();
 		await runTurn(provider, { messages: [userText("q1")], chunks: ok({ prompt_tokens: 1000, prompt_cache_hit_tokens: 800, completion_tokens: 1 }) });
 		check("no warning while healthy", shim.calls.showWarningMessage.length, 0);
-		// History carries an assistant turn the cache never saw → miss → "" stub; usage shows 0% hit.
-		await runTurn(provider, { messages: [userText("q1"), assistantText("never streamed here"), userText("q2")], chunks: ok({ prompt_tokens: 1000, prompt_cache_hit_tokens: 0, completion_tokens: 1 }) });
+		const failed = await quiet(() => runTurn(provider, { options: { tools: [{ name: "t" }] }, messages: [userText("q1"), assistantText("never streamed here"), userText("q2")], chunks: ok({ prompt_tokens: 1000, prompt_cache_hit_tokens: 0, completion_tokens: 1 }) }));
 		await tick();
-		checkMatch("breakdown warning fired", shim.calls.showWarningMessage.at(-1)?.message, /prompt cache hit rate dropped to 0% \(peak 80%\)/);
-		check("…buttons", shim.calls.showWarningMessage.at(-1)?.items.join(","), "Start New Chat,Show Cache Stats");
-		check("…Show Cache Stats runs the command", shim.calls.executeCommand.some((x) => x.id === "deepseekv4.showCacheStats"), true);
+		checkMatch("unavailable plain assistant original rejected locally", failed.error?.message, /original assistant reasoning is unavailable/);
+		check("no doomed request sent", failed.captured.url, undefined);
+		check("recovery buttons", shim.calls.showErrorMessage.at(-1)?.items.join(","), "Start New Chat,Show Log");
+		check("no post-network cache breakdown warning", shim.calls.showWarningMessage.length, 0);
 		provider.dispose();
 	}
 	// --- context nudge at 95% with 80% re-arm ---

@@ -14,9 +14,11 @@ VS Code LM API
 DeepSeekV4ChatModelProvider.provideLanguageModelChatResponse(model, messages, options, progress, token)
     │  → creates a fresh StreamContext (per-call state, see below)
     │
-    ├─ convertMessages(messages, {imageInput})  ← VS Code parts → OpenAI message[] (image data parts → image_url blocks on Vision variants, see "Multimodal image input")
-    ├─ attachReasoningToHistory(out)     ← inject cached reasoning_content into prior assistant turns
+    ├─ imageStats(messages)               ← validate accepted USER images before base64 allocation (Flash only)
+    ├─ convertMessages(messages, {imageInput, imageDetail})  ← VS Code parts → OpenAI message[] (image data parts → image_url blocks on Flash variants, see "Multimodal image input")
     ├─ convertTools(options)             ← VS Code tools → OpenAI function tool defs (host names → wire aliases, see "Tool-name wire aliasing")
+    ├─ selectAdvertisedTools(…)           ← retain at most 128 usable tools
+    ├─ attachReasoningToHistory(out)     ← restore every prior assistant original only for thinking + retained tools
     │
     ├─ POST /v1/chat/completions  (stream + thinking + tools)
     │
@@ -24,7 +26,7 @@ DeepSeekV4ChatModelProvider.provideLanguageModelChatResponse(model, messages, op
          │  split/classify SSE lines via the pure src/sse.ts (splitSseLines / parseSseData / extractDelta)
          ├─ delta.reasoning_content      → ctx.reasoning += chunk, emit ThinkingPart if available
          ├─ delta.content                → emit LanguageModelTextPart
-         ├─ delta.tool_calls             → ctx.toolCalls (ToolCallAssembler, sse.ts), emit LanguageModelToolCallPart once JSON args are valid (echoed wire alias mapped back to the host name)
+         ├─ delta.tool_calls             → ctx.toolCalls (ToolCallAssembler, sse.ts), validate advertised membership, arguments and IDs before emitting LanguageModelToolCallPart (wire alias mapped back to the host name)
          └─ finish_reason / [DONE]       → see "Finish reasons" below for the dispatch table
 ```
 
@@ -118,7 +120,7 @@ extension versions, so it must be a deliberate, versioned decision.
 Because tools can be skipped, DeepSeek's 128-tools-per-request cap is
 enforced against the **advertised** set, not `options.tools` — a host list
 slightly over 128 whose skips bring the broadcast set back under the cap is
-a legal request. The payload assembly itself (schema sanitization, skip
+a legal request. The payload assembly itself (schema validation, skip
 logic, tool_choice) lives in the vscode-free `src/tool_payload.ts` — the
 third extraction after `tool_names.ts` and `tool_choice.ts`, with
 `convertTools` reduced to a thin enum→boolean adapter — so
@@ -130,6 +132,50 @@ feeding `options.tools` — or any hand-computed number — fails to compile. A
 deliberately minimal, best-effort text pin over comment-stripped
 `out/provider.js` covers the two properties types can't enforce: the guard
 call exists, and no inline host-list count check has crept back.
+
+After conversion, the provider selects at most 128 advertised tools using
+`src/tool_selection.ts`. Exact host names in `deepseekv4.preferredTools`
+take priority, remaining slots fill in host order, and the retained set
+keeps its original order. Preferences never enable host-disabled tools.
+The provider logs available/advertised counts on each capped request and
+deduplicates the Configure Tools warning for consecutive identical tool
+sets and preferences. This
+keeps oversized tool sets from failing every chat turn; omitted tools are
+unavailable for that request. The existing advertised-set guard remains a
+defensive assertion. `tool_choice` remains `auto` or `required` for a capped
+set, and wire aliases and history are unchanged. Request-level boundary,
+skip-before-cap, preferences, warning deduplication, and alias round-trip
+tests live in `test/adapter_provider_request.mjs`.
+
+### Tool schema and dispatch validation
+
+`src/tool_schema.ts` preserves JSON Schema draft-07 semantics using Ajv
+without argument coercion, default insertion, or removal of properties.
+Composite schemas and declared numeric types are preserved, not rewritten.
+Unsupported keywords, formats, dialects, and invalid/unresolved schemas
+produce a diagnostic and skip only that tool. Remote references are never
+fetched. Compiled validators use a content-keyed cache bounded by both entry
+count and schema bytes; mutations invalidate the key, and private schema
+copies prevent caller mutations from changing existing validators.
+Server-side strict mode is not enabled: its current endpoint and
+schema subset could not be verified, and local validation does not imply a
+server-side guarantee.
+
+The request's dispatch map and validators contain only retained advertised
+tools. Before reporting a completed batch to VS Code, the provider checks
+membership, argument schema conformance, and call-ID uniqueness (including
+IDs from history). The assembler waits for original nonblank IDs and names;
+it rejects missing identity fields on clean completion and drops them on
+truncation, never synthesizing replacements. Invalid calls throw before dispatch; tool arguments are
+not included in the error diagnostics. Schema tests are in
+`test/unit_tool_schema.mjs`; dispatch tests are in
+`test/adapter_provider_tool_validation.mjs`.
+
+`validateRequest` in `src/utils.ts` requires nonempty, history-wide unique
+assistant call IDs and exactly one matching result per call. Parallel results
+may arrive in any order across consecutive user result messages. Orphaned,
+duplicate, unmatched results and unrelated messages during pending calls
+are rejected before the API request; historical IDs are never invented.
 
 ## Finish reasons
 
@@ -143,9 +189,9 @@ inside an HTTP-200 response:
 | `content_filter` | DS safety filter | Log only; flush best-effort, don't throw |
 | `insufficient_system_resource` | Backend mid-stream truncation (DS-specific) | Log, surface an `ErrorMessage` with a "Show Log" button, flush best-effort, don't throw |
 
-The non-clean cases never throw because partial tool-call JSON is *expected*
-on truncation; throwing would discard the reasoning_content already streamed
-to the UI. The user's chat input box will still let them resend; we don't
+The non-clean cases drop unparseable partial tool-call JSON because it is
+*expected* on truncation. Complete calls still undergo membership and schema
+validation before dispatch. The user's chat input box will still let them resend; we don't
 bind a "Retry" button to any chat-host command (no stable, panel-agnostic
 retry command exists in the public VS Code API).
 
@@ -171,7 +217,7 @@ Both are accepted trade-offs.
 Re-evaluate (and possibly switch) **only if** one of the following holds:
 
 - **`LanguageModelThinkingPart` graduates to stable API.** Our reflection path then auto-engages with zero code changes; we'd additionally consider deleting `_reasoningCache` if the host starts persisting thinking parts in chat history.
-- **A reasoning round-trip scenario emerges that the cache cannot cover.** Today the dual-mode fingerprint (`tc:` / `tx:` prefix) plus `globalState` persistence plus `reasoning_content=""` fallback covers every case we've encountered. If a future failure mode resists all three layers, the proposed API's host-side round-trip becomes worth its distribution cost.
+- **A reasoning round-trip scenario emerges that the cache cannot cover.** The dual-mode fingerprint (`tc:` / `tx:` prefix) and `globalState` persistence preserve known reasoning. Unavailable original reasoning now requires recovery rather than a synthesized empty fallback; a host-side round-trip API could help if it removes this limitation.
 - **Distribution model changes.** If the project ever pivots to Insiders-only or developer-preview audience, the cost calculus inverts.
 
 Until one of these triggers, the answer stays "no proposed API."
@@ -186,9 +232,21 @@ DeepSeek V4 thinking-mode multi-turn rule — as documented, and as the live ser
 >
 > **Observed:** the server has moved in steps. Originally every turn was enforced; around 2026-05 plain-text turns stopped needing it while tool-call turns still 400'd; on **2026-08-22** every shape we test was accepted without it — tool-call turns and plain turns, with and without `tools`, on `deepseek-v4-pro`, `deepseek-v4-flash` and the Vision model (`integration_round_trip` ×3, `integration_tools_present`, `integration_no_tc_assistant`, `integration_tools_advertised_no_tc`, `integration_cache_miss_fallback`, `integration_vision_multiturn`).
 
-We still attach `reasoning_content` to **every** prior assistant turn we have cache for. Reasons: (a) sending more is harmless, (b) it preserves prompt-cache prefix bytes when the same conversation continues (the prefix must be byte-identical to hit DS server cache), and (c) it future-proofs against the server tightening the rule again.
+The supplied current Thinking Mode guide confirms that requests with `tools`
+must replay **all** previous assistant reasoning, including completed earlier
+user rounds. Without `tools`, prior reasoning is ignored and does not enter
+context. The provider therefore restores reasoning only for thinking-mode
+requests with a nonempty advertised tool set, assembled before replay.
 
-When we have no cached reasoning for a tool-call turn, we used to fall back to `reasoning_content = ""` to avoid a guaranteed 400. The empty-string fallback is still in place because it's the conservative choice — but the integration tests in `test/integration_cache_miss_fallback.mjs` show the server now also accepts the turn being omitted entirely.
+An empty placeholder cannot replace unavailable original reasoning. Missing
+reasoning is diagnosed with actionable recovery guidance rather than relying
+on the historical server leniency recorded by
+`test/integration_cache_miss_fallback.mjs`. Generated reasoning is still cached
+on tool-less thinking turns so later requests that enable tools can replay it.
+Missing originals stop thinking-with-tools requests before transmission.
+An actually empty original is different: it is cached only after a clean,
+completed thinking response and restored as the empty string, never inferred
+from a canceled, failed, incomplete, or non-thinking response.
 
 VS Code's chat history is modeled after the OpenAI Chat Completions schema. **There is no field for `reasoning_content`.** By the time Copilot Chat hands `messages` back to us on the next request, every assistant turn has only `content` and `tool_calls` left — the reasoning has already been dropped, so we re-attach from our local cache.
 
@@ -198,7 +256,8 @@ Forwarding a tool_call turn without restored `reasoning_content` historically tr
 The reasoning_content in the thinking mode must be passed back to the API.
 ```
 
-As of 2026-08-22 the live server no longer returns it for any shape we test — but the docs still define the rule, so the round-trip mechanism stays, for three reasons: the model otherwise continues each agent turn from a history with its own chain of thought removed; the server prompt-cache prefix is byte-stable only if the same bytes are re-sent; and it keeps working unchanged if DeepSeek re-tightens. Treat the 400 as possible, not as current — the integration scripts report which way the server behaves on the day they run.
+Historical integration observations are not a guarantee of current API
+behavior. The documented full-replay rule is the implementation contract.
 
 ### Solution: local reasoning cache + fingerprint index
 
@@ -238,9 +297,9 @@ anchor — that constant text would give every such cancelled turn the same
 
 1. computes the same fingerprint from `msg.content` and `msg.tool_calls`;
 2. looks up `_reasoningCache.get(fp)` — on hit, sets `msg.reasoning_content`;
-3. on miss, sets `msg.reasoning_content = ""` as fallback. The model loses
-   that turn's reasoning context but the conversation survives instead of
-   deadlocking on a guaranteed 400. Cache misses are logged for diagnostics.
+3. on miss, reports unavailable original reasoning with recovery guidance.
+   It never claims that synthesizing an empty string guarantees API
+   compatibility.
 
 ## Fingerprint algorithm: why hybrid
 
@@ -327,13 +386,19 @@ A 20 MB cap with a 16-char text hash leaves the serialized payload well below VS
 ```typescript
 {
   thinking: { type: "enabled" | "disabled" },
-  reasoning_effort: "high" | "max",  // only applies when thinking is enabled
+  reasoning_effort: "low" | "high" | "max",  // only when thinking is enabled
 }
 ```
 
-The `reasoning_effort` value is read at request time from the `deepseekv4.reasoningEffort` user setting (default `max`). It is sent only when the variant has `thinking: true`. Per-request `[req] reasoning_effort=...` is logged to the output channel for observability.
+The setting defaults to `high`; existing explicit values are not migrated or
+overwritten. Aliases map `minimal` to `low`, `medium`/`xhigh` to `high`,
+and `ultra` to `max`. Unknown values use `high`. Effort is sent only for
+thinking variants and logged per request.
 
-In thinking mode DeepSeek ignores `temperature`, `top_p`, `presence_penalty`, and `frequency_penalty`. We omit them from the request body to keep it clean (better prompt-cache hit rate).
+Thinking mode ignores `temperature`, `presence_penalty`, and
+`frequency_penalty`; these are omitted. Finite numeric `top_p` is forwarded
+only in thinking mode, clamped to 0.95–1.0. In non-thinking mode the API fixes
+`top_p` at 1.0, so it is omitted.
 
 ### Usage capture
 
@@ -348,9 +413,9 @@ Per-turn **context-window** usage is reported to GitHub Copilot Chat's native co
 
 ### Multimodal image input (Vision variants)
 
-The two `deepseek-v4-flash-vision-exp` variants (added 2026-08; DeepSeek's
-first multimodal model) declare `capabilities.imageInput`, so Copilot Chat
-enables image attachments for them. The wire changes exactly one thing:
+All four Flash picker entries, including the legacy Vision entries, route to
+`deepseek-flash` and declare `capabilities.imageInput`. Existing picker IDs
+remain unchanged. The wire changes one message representation:
 a **user** message that carries at least one image switches `content` from a
 plain string to the OpenAI-style block array
 
@@ -371,33 +436,42 @@ Invariants, in decreasing order of importance:
   back to a string whenever no image survives, so every pre-vision
   conversation serializes exactly as before — the server prompt-cache
   prefix and the reasoning-cache fingerprints depend on this.
-- Images ride only on **user** turns. Assistant/system turns and tool
-  results never emit image blocks: the Vision guide says images in
-  `system`/`assistant` messages return 400, and Chat Completions documents
-  `tool` content as a plain string (only the Responses API, which we don't
-  use, documents images in tool outputs). `integration_vision_multiturn.mjs`
-  (2026-08-22) found Chat Completions **accepts** an `image_url` block
-  inside a `tool` message as well, so flattening tool results to text is
-  our choice, not an API limit — a candidate for tools that return
-  screenshots.
+- Images ride only on **user** turns. The supplied current Vision guide
+  rejects images in `system`, `assistant`, or `tool` messages. Earlier
+  live-test leniency does not override the documented restriction.
 - MIME gate: JPEG/PNG/GIF/WebP (declared MIME, normalized —
   `image/jpg` → `image/jpeg`, parameters stripped). Unsupported images are
   dropped with a `console.warn`, never sent — one bad attachment must not
-  fail the whole request. On non-Vision variants every image is dropped
+  fail the whole request. On Pro variants every image is dropped
   (with a warn); there is deliberately no vision-proxy fallback.
-- Token budgeting: images bill at up to **384 tokens each**
+- Token budgeting: images bill at up to **1024 tokens each**
   (`IMAGE_TOKENS_PER_IMAGE`); counted into the pre-flight overflow check,
   the context-usage estimate, and `provideTokenCount`, and subtracted
-  before the chars/token EMA calibration (images add prompt tokens without
-  adding chars, which would otherwise drag the ratio).
+  alongside transmitted text, tool results, historical call arguments, and
+  reasoning that actually enters context. Image tokens are separated from
+  the text estimator.
 - Transport cap: DeepSeek rejects request bodies over **48 MiB**
-  (`MAX_REQUEST_BODY_BYTES`; base64 counts). The serialized body is
-  checked once before fetch and an actionable error ("attach fewer/smaller
+  (`MAX_REQUEST_BODY_BYTES`; base64 counts). UTF-8 byte length, not JavaScript
+  string length, is checked before fetch and an actionable error ("attach fewer/smaller
   images") replaces the opaque server 4xx. A single inline image is capped
   at **32 MiB** (`MAX_IMAGE_BYTES`, raw bytes): the largest user-turn
-  attachment is checked before the body is built, same treatment.
+  attachment is checked before the body is built, same treatment. Request
+  count is capped at 600 transmitted images; dimensions are capped at 8192
+  pixels per side or 4096 for requests with 15 or more images. Metadata is
+  inspected before base64 construction. Unsupported/dropped images do not
+  affect limits or planning.
 
-#### Verified against the official docs (2026-08-22)
+`deepseekv4.imageDetail` optionally adds `detail` (`low`, `high`, `original`,
+or `auto`) to each `image_url`. When no setting is explicit, the field is
+omitted and the API's `original` default applies. External URLs and Files
+API reuse remain separate, unimplemented features.
+
+#### Historical documentation snapshot (2026-08-22)
+
+The following records the earlier investigation, not current constants or
+model routing. The supplied 2026-10-05 Vision screenshot supersedes its
+384-token image ceiling, exclusive experimental-model routing, and any
+tool-message image leniency.
 
 Every vision fact above was originally taken from search summaries; on
 2026-08-22 they were re-checked against the official pages
@@ -545,8 +619,8 @@ Files in `test/integration_*.mjs` hit the live DeepSeek API directly, **bypassin
 - `integration_no_tc_assistant.mjs` — reasoning round-trip rules without `tools`
 - `integration_tools_present.mjs` — **the strict rule with `tools` present** (the corner case this extension is built around; enforced as a 400 until mid-2026, accepted since 2026-08-22 — the script reports which way the server behaves today)
 - `integration_tools_advertised_no_tc.mjs` — reasoning rules when tools are advertised but the turn makes no tool call
-- `integration_cache_miss_fallback.mjs` — the `reasoning_content: ""` stub keeps a conversation alive after a cache miss
-- `integration_vision.mjs` — multimodal content blocks against `deepseek-v4-flash-vision-exp`: generates a solid-red PNG locally and requires the model to *see* it, in both thinking and non-thinking modes
+- `integration_cache_miss_fallback.mjs` — historical probe of server leniency for missing/empty reasoning, not the provider's current replay policy
+- `integration_vision.mjs` — multimodal content blocks against `deepseek-flash`: generates a solid-red PNG locally and requires the model to *see* it, in both thinking and non-thinking modes
 - `integration_vision_multiturn.mjs` — the agent-mode interactions `integration_vision.mjs` leaves open: a three-turn Vision + tools + thinking round-trip with the history shapes the extension actually sends (block-array user turn, assistant tool_call + `reasoning_content`, tool result). Hard checks: the model tool-calls with the image's color and every history shape is accepted. Recorded (informational): whether the re-sent image prefix hits the server prompt cache (`usage.prompt_cache_hit_tokens` vs the prior prompt size — the fact that decides whether Files API `file_id` reuse is worth anything), whether Vision enforces the strict `reasoning_content` rule, and whether a `tool`-role message may carry an image block
 
 Run locally:
