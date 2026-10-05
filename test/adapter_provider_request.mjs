@@ -202,6 +202,14 @@ async function main() {
 		}
 		const wide = await sharp({ create: { width: 8193, height: 1, channels: 3, background: "white" } }).png().toBuffer();
 		const medium = await sharp({ create: { width: 4097, height: 1, channels: 3, background: "white" } }).png().toBuffer();
+		{
+			shim.reset();
+			const { provider } = makeProvider();
+			const turn = await runTurn(provider, { model: model("deepseek-v4-flash"), messages: [userImageMsg("look", png, "application/octet-stream")] });
+			check("generic declaration actual PNG sent", JSON.parse(turn.captured.body).messages[0].content[1].image_url.url.startsWith("data:image/png;base64,"), true);
+			check("generic declaration image included in preflight accounting", provider.contextUsage.getSnapshot().estimatedMessageTokens, Math.ceil(4 / 3) + 1024);
+			provider.dispose();
+		}
 		for (const [label, messages, regex] of [
 			["single dimension", [userImageMsg("wide", wide)], /8192 pixels/],
 			["many-image dimension", [userImageMsg("medium", medium), ...Array.from({ length: 14 }, () => userImageMsg("small", png))], /4096 pixels/],

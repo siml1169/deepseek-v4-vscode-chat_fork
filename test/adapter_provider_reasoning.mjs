@@ -142,6 +142,23 @@ async function main() {
 		check("known original loss was not sent", lost.captured.url, undefined);
 		provider.dispose();
 	}
+	// --- losing a text original stays an error after reload, without any empty-original turns ---
+	{
+		shim.reset();
+		const { provider, memento } = makeProvider();
+		const original = await runTurn(provider, { chunks: [reasoningChunk("original nonempty chain"), contentChunk("original text answer"), finishChunk("stop"), DONE] });
+		const text = original.progress.texts().join("");
+		await provider.clearReasoningCache();
+		provider.dispose();
+		const second = makeProvider({ memento }).provider;
+		const replay = (await withConsole("error", () => runTurn(second, {
+			messages: [userText("first"), assistantText(text), userText("continue")],
+			options: { tools: [{ name: "t" }] },
+		}))).result;
+		checkMatch("lost text original still rejected after reload without prior empty turns", replay.error?.message, /original assistant reasoning is unavailable/);
+		check("lost text original after reload is never sent", replay.captured.url, undefined);
+		second.dispose();
+	}
 	// --- completed thinking tools can have a genuinely empty original, including after reload ---
 	{
 		shim.reset();
@@ -179,6 +196,13 @@ async function main() {
 			progress: { report: () => cancel.cancel() },
 		});
 		check("cancelled: no fabricated empty original", provider._reasoningCache.size(), 0);
+		const bufferedCancel = cancellation();
+		await runTurn(provider, {
+			chunks: [contentChunk("cancelled before buffered finish"), finishChunk("stop"), DONE],
+			cancellation: bufferedCancel,
+			progress: { report: () => bufferedCancel.cancel() },
+		});
+		check("cancel before buffered clean finish: no fabricated empty original", provider._reasoningCache.size(), 0);
 		check("unavailable original is not stored as empty", provider._reasoningCache.size(), 0);
 		provider.dispose();
 	}

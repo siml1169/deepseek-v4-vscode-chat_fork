@@ -251,6 +251,7 @@ class StreamContext {
 	reasoningPersisted = false;
 	thinking = false;
 	completed = false;
+	cancelled = false;
 	/** Visible text emitted this turn — fallback fingerprint when no tool_calls. */
 	emittedText = "";
 	/** Tool calls emitted this turn — primary fingerprint anchor when present. */
@@ -1526,6 +1527,7 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 		token: vscode.CancellationToken
 	): Promise<DSUsage | undefined> {
 		const reader = responseBody.getReader();
+		ctx.cancelled = token.isCancellationRequested;
 		// Bridge user-cancellation into reader.cancel() so an in-flight
 		// `await reader.read()` resolves immediately (done=true) instead of
 		// blocking until the next SSE chunk arrives. Without this, cancelling
@@ -1533,6 +1535,7 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 		// DeepSeek emits its next byte — could be tens of seconds for
 		// max-effort reasoning chains.
 		const cancelSub = token.onCancellationRequested(() => {
+			ctx.cancelled = true;
 			void reader.cancel().catch(() => {
 				/* reader already closed */
 			});
@@ -1833,7 +1836,7 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 		if (!ctx.reasoning) {
 			// Only a completed thinking response proves an empty original.
 			// Cancellation, incomplete streams and disabled thinking do not.
-			if (!ctx.thinking || !ctx.completed) {
+			if (!ctx.thinking || !ctx.completed || ctx.cancelled) {
 				return;
 			}
 		}

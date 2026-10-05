@@ -3,7 +3,7 @@ import type { OpenAIChatMessage, OpenAIChatRole, OpenAIFunctionToolDef, OpenAITo
 import { toWireName } from "./tool_names";
 import type { ToolChoice } from "./tool_choice";
 import { buildToolPayload } from "./tool_payload";
-import { buildUserContent, normalizeImageMime, coerceImageDetail, type UserContentInput } from "./image_content";
+import { buildUserContent, normalizeImageMime, coerceImageDetail, isSupportedImageData, type UserContentInput } from "./image_content";
 import type { ImageDetail } from "./types";
 
 // Tool-name validation/wire-aliasing live in `./tool_names.ts` and the tool
@@ -127,16 +127,28 @@ export function convertMessages(
  * `instanceof vscode.LanguageModelDataPart` — real instances pass it, and so
  * does a part serialized across the extension-host boundary ({mimeType,
  * data}), which instanceof would miss (same reason the cache_control
- * sentinel in collectToolResultText is duck-typed). MIME support is NOT
- * checked here — unsupported images must reach buildUserContent so they are
- * counted and warned about, not silently ignored as unknown parts.
+ * sentinel in collectToolResultText is duck-typed). Declared image parts
+ * reach the builder for validation/drop diagnostics; generic binary parts
+ * are accepted only when their actual bytes identify a supported image.
  */
 export function isImageDataPart(value: unknown): value is { mimeType: string; data: Uint8Array } {
 	if (!value || typeof value !== "object") {
 		return false;
 	}
 	const obj = value as { mimeType?: unknown; data?: unknown };
-	return typeof obj.mimeType === "string" && normalizeImageMime(obj.mimeType).startsWith("image/") && obj.data instanceof Uint8Array;
+	if (typeof obj.mimeType !== "string" || !(obj.data instanceof Uint8Array)) {
+		return false;
+	}
+	if (normalizeImageMime(obj.mimeType).startsWith("image/")) {
+		return true;
+	}
+	// Generic data parts can also carry images, but must not turn PDFs or
+	// host-control sentinels into image attachments merely because they are bytes.
+	try {
+		return isSupportedImageData(obj.data);
+	} catch {
+		return false;
+	}
 }
 
 /** Collect user attachments without allocating base64 strings. */

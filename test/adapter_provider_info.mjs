@@ -44,6 +44,8 @@ async function main() {
 			check(`${id}: accepted image cost matches capability`, await provider.provideTokenCount(model(id), msg, cancellation().token), 3 + (id.includes("flash") ? 1024 : 0));
 		}
 		check("unsupported images do not cost tokens", await provider.provideTokenCount(model("deepseek-v4-flash"), { ...msg, content: [new vscode.LanguageModelDataPart(bmp, "image/bmp")] }, cancellation().token), 0);
+		check("actual PNG with generic declaration costs image tokens", await provider.provideTokenCount(model("deepseek-v4-flash"), { ...msg, content: [new vscode.LanguageModelDataPart(png, "application/octet-stream")] }, cancellation().token), 1024);
+		check("PDF bytes with generic declaration do not cost image tokens", await provider.provideTokenCount(model("deepseek-v4-flash"), { ...msg, content: [new vscode.LanguageModelDataPart(Buffer.from("%PDF-1.7 binary data"), "application/octet-stream")] }, cancellation().token), 0);
 		check("non-user images do not cost tokens", await provider.provideTokenCount(model("deepseek-v4-flash"), { ...msg, role: vscode.LanguageModelChatMessageRole.Assistant }, cancellation().token), 3);
 		check("historical arguments counted", await provider.provideTokenCount(model("deepseek-v4-pro"), assistantToolCallMsg("", [{ callId: "c", name: "t", input: { text: "abcdef" } }]), cancellation().token), Math.ceil('{"text":"abcdef"}'.length / 3));
 		check("tool results counted", await provider.provideTokenCount(model("deepseek-v4-pro"), toolResultMsg([{ callId: "c", content: ["abcdefghi"] }]), cancellation().token), 3);

@@ -94,6 +94,9 @@ const bmp = Buffer.from("424d3a0000000000000036000000280000000100000001000000010
 		check(`image detail ${imageDetail} propagated`, convertMessages([userImageMsg("look", png)], { imageInput: true, imageDetail })[0].content[1].image_url.detail, imageDetail);
 	}
 	check("invalid image detail omitted", convertMessages([userImageMsg("look", png)], { imageInput: true, imageDetail: "invalid" })[0].content[1].image_url.detail, undefined);
+	check("actual PNG with unsupported image declaration uses actual MIME", convertMessages([userImageMsg("look", png, "image/avif")], { imageInput: true })[0].content[1].image_url.url.startsWith("data:image/png;base64,"), true);
+	check("actual PNG with generic binary declaration uses actual MIME", convertMessages([userImageMsg("look", png, "application/octet-stream")], { imageInput: true })[0].content[1].image_url.url.startsWith("data:image/png;base64,"), true);
+	checkDeep("nonimage binary data is not treated as an image attachment", convertMessages([userImageMsg("look", Buffer.from("%PDF-1.7 arbitrary PDF bytes"), "application/octet-stream")], { imageInput: true }), [{ role: "user", content: "look" }]);
 }
 
 // --- a realistic agent history in one call ---
