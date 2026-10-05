@@ -25,7 +25,7 @@ import { buildRequestBody, coerceReasoningEffort } from "./request_body";
 import { MODEL_VARIANTS, findVariant } from "./model_catalog";
 import { BASE_URL, BALANCE_URL, fetchWithRetry, formatApiError, type BalanceInfo } from "./api_client";
 import { toWireName, buildWireNameMap } from "./tool_names";
-import { assertAdvertisedToolLimit } from "./tool_limit";
+import { assertAdvertisedToolLimit, MAX_TOOLS_PER_REQUEST } from "./tool_limit";
 import { ReasoningCache, fingerprintAssistantTurn, type CachedTurn, type ReasoningCacheStats } from "./reasoning_cache";
 import { shouldWarnCacheBreakdown } from "./cache_breakdown";
 import { ContextUsageService } from "./context_usage_service";
@@ -1163,6 +1163,16 @@ export class DeepSeekV4ChatModelProvider implements LanguageModelChatProvider {
 			validateRequest(messages);
 
 			const toolConfig = convertTools(options);
+			if (toolConfig.tools && toolConfig.tools.length > MAX_TOOLS_PER_REQUEST) {
+				const available = toolConfig.tools.length;
+				// Preserve host order and wire aliases; tool_choice is still
+				// auto/required since the retained set has multiple tools.
+				toolConfig.tools = toolConfig.tools.slice(0, MAX_TOOLS_PER_REQUEST);
+				this.log("request.tools_limited", { available, advertised: toolConfig.tools.length });
+				void vscode.window.showWarningMessage(
+					`DeepSeek supports at most ${MAX_TOOLS_PER_REQUEST} tools per request. Using the first ${MAX_TOOLS_PER_REQUEST} of ${available} tools; ${available - MAX_TOOLS_PER_REQUEST} tools are unavailable for this request. Use Copilot Chat's Configure Tools picker to disable unneeded tools or MCP servers.`
+				);
+			}
 			// Reverse map for THIS request's tool set (first-wins on the
 			// astronomically-rare wire-name collision, mirroring the
 			// advertise-side skip in convertTools).
